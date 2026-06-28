@@ -1,0 +1,27 @@
+/* eslint-disable no-undef */
+pref("authkey", "");
+pref("useLocalBackend", true);
+pref("localBackendUrl", "http://127.0.0.1:8765/zotero");
+pref("localBackendToken", "");
+pref("localBackendAutoStart", true);
+pref("localBackendProjectDir", "");
+pref("localBackendUvPath", "");
+pref("localModelConfigs", "{}");
+pref("targetLanguage", "zh-CN");
+pref("translateMode", "dual");
+pref("translateModel", "kimi");
+pref("enhanceCompatibility", false);
+pref("autoTranslate", false);
+pref("autoOpenPDF", true);
+pref("ocrWorkaround", "auto");
+pref("autoExtractGlossary", false);
+pref("richTextTranslate", true);
+pref("primaryFontFamily", "none");
+pref("dualMode", "lort");
+pref("customSystemPrompt", "");
+pref("fakeUserId", "");
+pref("enableShortcuts", true);
+pref("shortcutTranslate", "Mod+Shift+B");
+pref("shortcutTaskManager", "Mod+Shift+H");
+pref("layoutModel", "version_3");
+pref("skipNetworkWarning", false);

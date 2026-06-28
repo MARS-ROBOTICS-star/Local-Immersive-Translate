@@ -1,0 +1,27 @@
+# dot files
+.DS_Store
+
+# Node.js
+node_modules
+yarn.lock
+.local-node/
+.local-corepack/
+
+# TSC
+tsconfig.tsbuildinfo
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Scaffold
+.env
+.scaffold
+build
+logs
+dist
+
+# Local BabelDOC backend
+BabelDOC/
+.local-babeldoc
+local_babeldoc_server/config.local.json

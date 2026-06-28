@@ -1,0 +1,82 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg width="96" height="96" viewBox="135 125 750 750" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <title>Local PDF Translation Icon</title>
+  <desc>High-resolution vector SVG: PDF document with A and 文 columns, translation arrows, and a local node symbol.</desc>
+
+  <!-- Document body -->
+  <path
+    d="M283 145
+       H640
+       L782 285
+       V790
+       Q782 850 722 850
+       H280
+       Q220 850 220 790
+       V210
+       Q220 145 283 145
+       Z"
+    fill="#F8FAFC"
+    stroke="#FD4489"
+    stroke-width="12"
+    stroke-linejoin="round"/>
+
+  <!-- Fold inner contour -->
+  <path
+    d="M640 145
+       V243
+       Q640 285 682 285
+       H782"
+    stroke="#FD4489"
+    stroke-width="12"
+    stroke-linecap="round"
+    stroke-linejoin="round"/>
+
+  <!-- Left label: A converted to vector path -->
+  <path d="M331.11 345.00 L340.31 345.00 L345.60 329.94 L369.00 329.94 L374.13 345.00 L383.51 345.00 L362.61 287.00 L352.18 287.00 L331.11 345.00 Z M348.21 322.58 L351.83 312.30 C353.42 307.52 355.09 302.41 357.44 294.90 C359.73 302.41 361.36 307.52 362.95 312.30 L366.47 322.58 L348.21 322.58 Z" fill="#1F2937" fill-rule="evenodd"/>
+
+  <!-- Right label: 文 converted to vector path -->
+  <path d="M646.97 288.00 L646.97 297.45 L623.58 297.45 L623.58 304.39 L632.12 304.39 C635.39 313.12 639.43 320.54 644.84 326.66 C638.78 331.30 631.35 334.67 622.50 337.05 C623.93 338.78 626.18 342.16 627.02 344.00 C636.10 341.15 643.82 337.29 650.30 332.07 C656.59 337.41 664.31 341.33 673.94 343.82 C675.00 341.80 677.32 338.42 679.04 336.70 C669.95 334.67 662.41 331.18 656.30 326.48 C661.82 320.49 666.15 313.24 669.36 304.39 L677.97 304.39 L677.97 297.45 L654.27 297.45 L654.27 288.00 L646.97 288.00 Z M650.65 321.38 C646.08 316.56 642.58 310.81 640.09 304.39 L660.93 304.39 C658.43 311.11 654.99 316.75 650.65 321.38 Z" fill="#4D9BE4" fill-rule="evenodd"/>
+
+  <!-- Source text lines -->
+  <g fill="#475366">
+    <rect x="268" y="370" width="180" height="13" rx="6.5"/>
+    <rect x="268" y="414" width="166" height="13" rx="6.5"/>
+    <rect x="268" y="458" width="154" height="13" rx="6.5"/>
+    <rect x="268" y="502" width="149" height="13" rx="6.5"/>
+    <rect x="268" y="546" width="157" height="13" rx="6.5"/>
+    <rect x="268" y="590" width="155" height="13" rx="6.5"/>
+    <rect x="268" y="634" width="169" height="13" rx="6.5"/>
+    <rect x="268" y="678" width="181" height="13" rx="6.5"/>
+  </g>
+
+  <!-- Translated text lines -->
+  <g fill="#4D9BE4">
+    <rect x="568" y="370" width="160" height="13" rx="6.5"/>
+    <rect x="568" y="414" width="160" height="13" rx="6.5"/>
+    <rect x="568" y="458" width="160" height="13" rx="6.5"/>
+    <rect x="568" y="502" width="160" height="13" rx="6.5"/>
+    <rect x="568" y="546" width="160" height="13" rx="6.5"/>
+    <rect x="568" y="590" width="160" height="13" rx="6.5"/>
+    <rect x="568" y="634" width="160" height="13" rx="6.5"/>
+    <rect x="568" y="678" width="96" height="13" rx="6.5"/>
+  </g>
+
+  <!-- Bidirectional conversion arrows -->
+  <g stroke="#1F2937" stroke-width="10" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M515 505 H464"/>
+    <path d="M464 505 L491 478"/>
+    <path d="M464 505 L491 532"/>
+    <path d="M474 548 H535"/>
+    <path d="M535 548 L508 521"/>
+    <path d="M535 548 L508 575"/>
+  </g>
+
+  <!-- Local node symbol -->
+  <g stroke="#F59E0B" stroke-width="10" stroke-linecap="round" stroke-linejoin="round" fill="#F59E0B">
+    <path d="M665 740 L602 807"/>
+    <path d="M665 740 L728 807"/>
+    <circle cx="665" cy="740" r="27"/>
+    <circle cx="602" cy="807" r="17"/>
+    <circle cx="728" cy="807" r="17"/>
+  </g>
+</svg>

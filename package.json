@@ -1,0 +1,74 @@
+{
+  "name": "local-immersive-translate",
+  "type": "module",
+  "version": "0.0.23",
+  "description": "Local Zotero PDF translation plugin powered by BabelDOC.",
+  "keywords": [
+    "zotero",
+    "babeldoc",
+    "plugin",
+    "pdf-translation",
+    "translation"
+  ],
+  "config": {
+    "addonName": "本地沉浸式翻译",
+    "addonID": "zotero@local-immersive-translate",
+    "addonRef": "localimmersivetranslate",
+    "addonInstance": "LocalImmersiveTranslate",
+    "prefsPrefix": "extensions.zotero.localimmersivetranslate",
+    "xpiName": "local-immersive-translate"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/MARS-ROBOTICS-star/Local-Immersive-Translate.git"
+  },
+  "author": "MARS-ROBOTICS-star",
+  "bugs": {
+    "url": "https://github.com/MARS-ROBOTICS-star/Local-Immersive-Translate/issues"
+  },
+  "homepage": "https://github.com/MARS-ROBOTICS-star/Local-Immersive-Translate#readme",
+  "license": "AGPL-3.0-or-later",
+  "scripts": {
+    "start": "zotero-plugin serve",
+    "build": "zotero-plugin build && tsc --noEmit",
+    "build:dev": "zotero-plugin build --dev && tsc --noEmit",
+    "lint:check": "prettier --check . && eslint .",
+    "lint:fix": "prettier --write . && eslint . --fix",
+    "release": "zotero-plugin release",
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "update-deps": "npm update --save"
+  },
+  "dependencies": {
+    "zotero-plugin-toolkit": "5.1.2"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.23.0",
+    "@types/bluebird": "^3.5.42",
+    "@types/node": "^22.13.13",
+    "@types/react": "^19.1.3",
+    "epubjs": "^0.3.93",
+    "eslint": "^9.23.0",
+    "pdfjs-dist": "^5.2.133",
+    "prettier": "^3.5.3",
+    "typescript": "^5.8.2",
+    "typescript-eslint": "^8.28.0",
+    "zotero-plugin-scaffold": "^0.4.1",
+    "zotero-types": "^4.1.0-beta.1"
+  },
+  "prettier": {
+    "printWidth": 80,
+    "tabWidth": 2,
+    "endOfLine": "lf",
+    "overrides": [
+      {
+        "files": [
+          "*.xhtml"
+        ],
+        "options": {
+          "htmlWhitespaceSensitivity": "css"
+        }
+      }
+    ]
+  },
+  "packageManager": "pnpm@9.15.9"
+}

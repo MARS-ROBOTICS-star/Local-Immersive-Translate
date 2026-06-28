@@ -1,0 +1,73 @@
+{
+  "server": {
+    "host": "127.0.0.1",
+    "port": 8765,
+    "public_base_url": "",
+    "token": "",
+    "max_concurrent_jobs": 1
+  },
+  "babeldoc": {
+    "repo_path": "./BabelDOC",
+    "data_dir": "./.local-babeldoc",
+    "lang_in": "en",
+    "qps": 4,
+    "pool_max_workers": 4,
+    "term_pool_max_workers": 2,
+    "report_interval_seconds": 0.5,
+    "max_pages_per_part": 20,
+    "watermark": "no_watermark",
+    "debug": false,
+    "enable_json_mode_if_requested": false,
+    "send_dashscope_header": false,
+    "send_temperature": true,
+    "disable_same_text_fallback": false,
+    "skip_scanned_detection": false,
+    "skip_form_render": false,
+    "skip_curve_render": false,
+    "remove_non_formula_lines": false
+  },
+  "models": {
+    "kimi": {
+      "label": "Kimi",
+      "base_url": "",
+      "api_key": "env:KIMI_API_KEY",
+      "model": ""
+    },
+    "qwen-1": {
+      "label": "Qwen",
+      "base_url": "",
+      "api_key": "env:QWEN_API_KEY",
+      "model": ""
+    },
+    "deepseek": {
+      "label": "DeepSeek",
+      "base_url": "",
+      "api_key": "env:DEEPSEEK_API_KEY",
+      "model": ""
+    },
+    "glm-paid-1": {
+      "label": "GLM 4.7",
+      "base_url": "",
+      "api_key": "env:GLM_API_KEY",
+      "model": ""
+    },
+    "gpt-1": {
+      "label": "OpenAI",
+      "base_url": "",
+      "api_key": "env:OPENAI_API_KEY",
+      "model": ""
+    },
+    "gemini-1": {
+      "label": "Gemini",
+      "base_url": "",
+      "api_key": "env:GEMINI_API_KEY",
+      "model": ""
+    },
+    "glm-free-1": {
+      "label": "GLM-4-Flash",
+      "base_url": "",
+      "api_key": "env:GLM_API_KEY",
+      "model": ""
+    }
+  }
+}
