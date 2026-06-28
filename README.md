@@ -83,8 +83,5 @@ powershell -ExecutionPolicy Bypass -File .\install-local-backend.ps1
 
 本项目当前使用 AGPL-3.0-or-later 协议。
 
-AGPL 是强 copyleft 开源协议：你可以使用、修改和分发代码，但如果你发布修改版，或把修改版作为网络服务提供给其他人使用，通常也需要公开对应源代码。
-
-MIT 是更宽松的开源协议：通常只要求保留版权和许可声明，允许闭源商用、私有修改和再发布。
 
 简单来说，AGPL 更强调“修改后的代码也继续开源”，MIT 更强调“使用限制尽量少”。
