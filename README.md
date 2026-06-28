@@ -82,6 +82,3 @@ powershell -ExecutionPolicy Bypass -File .\install-local-backend.ps1
 ## License
 
 本项目当前使用 AGPL-3.0-or-later 协议。
-
-
-简单来说，AGPL 更强调“修改后的代码也继续开源”，MIT 更强调“使用限制尽量少”。
