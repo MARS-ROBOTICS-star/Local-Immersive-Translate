@@ -281,6 +281,43 @@ class AppState:
         with self.jobs_lock:
             return self.jobs.get(pdf_id)
 
+    def get_job_or_recover_finished(self, pdf_id: str) -> Job | None:
+        job = self.get_job(pdf_id)
+        if job is not None:
+            return job
+        return self._recover_finished_job_from_outputs(pdf_id)
+
+    def _recover_finished_job_from_outputs(self, pdf_id: str) -> Job | None:
+        safe_pdf_id = safe_object_key(pdf_id)
+        output_dir = self.output_dir / safe_pdf_id
+        if not output_dir.is_dir():
+            return None
+
+        mono_path = self._latest_pdf(output_dir, "*.mono.pdf")
+        dual_path = self._latest_pdf(output_dir, "*.dual.pdf")
+        if not mono_path or not dual_path:
+            return None
+
+        created_at = max(mono_path.stat().st_mtime, dual_path.stat().st_mtime)
+        job = Job(
+            pdf_id=safe_pdf_id,
+            object_key="",
+            file_name=mono_path.name,
+            request_model="",
+            target_language="",
+            model_config=None,
+            options={},
+            created_at=created_at,
+            status="success",
+            stage="completed",
+            progress=100.0,
+            translation_pdf_path=str(mono_path),
+            dual_pdf_path=str(dual_path),
+        )
+        self.add_job(job)
+        logger.info("Recovered completed BabelDOC job from outputs: %s", safe_pdf_id)
+        return job
+
     def update_job(self, pdf_id: str, **updates: Any) -> None:
         with self.jobs_lock:
             job = self.jobs[pdf_id]
@@ -757,7 +794,7 @@ class LocalBabelDOCHandler(BaseHTTPRequestHandler):
         self._send_error(HTTPStatus.NOT_FOUND, f"not found: {path}")
 
     def _send_process_status(self, pdf_id: str) -> None:
-        job = self.server.state.get_job(pdf_id)
+        job = self.server.state.get_job_or_recover_finished(pdf_id)
         if not job:
             self._send_error(HTTPStatus.NOT_FOUND, f"job not found: {pdf_id}")
             return
@@ -781,7 +818,7 @@ class LocalBabelDOCHandler(BaseHTTPRequestHandler):
         )
 
     def _send_temp_urls(self, pdf_id: str) -> None:
-        job = self.server.state.get_job(pdf_id)
+        job = self.server.state.get_job_or_recover_finished(pdf_id)
         if not job:
             self._send_error(HTTPStatus.NOT_FOUND, f"job not found: {pdf_id}")
             return
@@ -810,7 +847,7 @@ class LocalBabelDOCHandler(BaseHTTPRequestHandler):
         )
 
     def _send_download(self, pdf_id: str, kind: str) -> None:
-        job = self.server.state.get_job(pdf_id)
+        job = self.server.state.get_job_or_recover_finished(pdf_id)
         if not job:
             self._send_error(HTTPStatus.NOT_FOUND, f"job not found: {pdf_id}")
             return

@@ -10,6 +10,7 @@ import {
 } from "../utils/local-model-config";
 import {
   ensureLocalBackendRunning,
+  installOrRepairLocalBackend,
   normalizeLocalBackendPrefs,
 } from "./local-backend";
 import { getLanguages, getLanguageName } from "./language";
@@ -435,6 +436,7 @@ function renderLocalModelConfigFields(doc: Document) {
 
 function bindPrefEvents() {
   bindShortcutPrefEvents();
+  let isInstallingLocalBackend = false;
   let isTestingLocalBackend = false;
 
   function syncLocalBackendPrefsFromInputs() {
@@ -493,6 +495,54 @@ function bindPrefEvents() {
   const testButton = addon.data.prefs!.window.document?.querySelector(
     `#zotero-prefpane-${config.addonRef}-test-button`,
   ) as XUL.Button | null;
+  const installButton = addon.data.prefs!.window.document?.querySelector(
+    `#zotero-prefpane-${config.addonRef}-install-button`,
+  ) as XUL.Button | null;
+
+  const handleInstallLocalBackend = async (e: Event) => {
+    e.preventDefault();
+    if (isInstallingLocalBackend) {
+      return;
+    }
+    isInstallingLocalBackend = true;
+    syncLocalBackendPrefsFromInputs();
+    installButton?.setAttribute("disabled", "true");
+    testButton?.setAttribute("disabled", "true");
+    const progressWindow = new ztoolkit.ProgressWindow(
+      addon.data.config.addonName,
+      {
+        closeOnClick: true,
+        closeTime: -1,
+      },
+    )
+      .createLine({
+        text: getString("pref-install-starting"),
+        type: "default",
+        progress: 20,
+      })
+      .show();
+    try {
+      const result = await installOrRepairLocalBackend();
+      progressWindow.changeLine({
+        text: result.message,
+        type: result.ok ? "success" : "error",
+        progress: 100,
+      });
+      progressWindow.startCloseTimer(result.ok ? 3000 : 5000);
+      showDialog({
+        title: getString(
+          result.ok
+            ? "pref-install-success-title"
+            : "pref-install-failed-title",
+        ),
+        message: result.message,
+      });
+    } finally {
+      installButton?.removeAttribute("disabled");
+      testButton?.removeAttribute("disabled");
+      isInstallingLocalBackend = false;
+    }
+  };
 
   const handleTestLocalBackend = async (e: Event) => {
     e.preventDefault();
@@ -576,6 +626,18 @@ function bindPrefEvents() {
       `#zotero-prefpane-${config.addonRef}-test-button`,
     )
     ?.addEventListener("click", handleTestLocalBackend);
+
+  addon.data
+    .prefs!.window.document?.querySelector(
+      `#zotero-prefpane-${config.addonRef}-install-button`,
+    )
+    ?.addEventListener("command", handleInstallLocalBackend);
+
+  addon.data
+    .prefs!.window.document?.querySelector(
+      `#zotero-prefpane-${config.addonRef}-install-button`,
+    )
+    ?.addEventListener("click", handleInstallLocalBackend);
 }
 
 function bindShortcutPrefEvents() {

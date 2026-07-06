@@ -63,10 +63,6 @@ export default defineConfig({
         entryPoints: ["src/index.ts"],
         define: {
           __env__: `"${process.env.NODE_ENV}"`,
-          __NEW_GA_MEASUREMENT_ID__: `"${process.env.NEW_GA_MEASUREMENT_ID}"`,
-          __NEW_GA_API_SECRET__: `"${process.env.NEW_GA_API_SECRET}"`,
-          __OLD_GA_MEASUREMENT_ID__: `"${process.env.OLD_GA_MEASUREMENT_ID}"`,
-          __OLD_GA_API_SECRET__: `"${process.env.OLD_GA_API_SECRET}"`,
         },
         bundle: true,
         plugins: [toolkitImportCompatPlugin],

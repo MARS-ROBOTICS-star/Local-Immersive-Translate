@@ -5,6 +5,7 @@ param(
   [string]$RepoRef = "",
   [string]$BabelDocRef = "",
   [switch]$AssumeYes,
+  [switch]$SkipProjectUpdate,
   [string]$UvInstallUrl = "https://astral.sh/uv/install.ps1"
 )
 
@@ -104,16 +105,78 @@ function Get-OriginDefaultBranch {
   return "main"
 }
 
+function Get-GitHubArchiveUrl {
+  param(
+    [Parameter(Mandatory = $true)]
+    [string]$RepositoryUrl,
+    [string]$RepositoryRef = "main"
+  )
+
+  $normalizedUrl = $RepositoryUrl -replace '\.git$', ''
+  if ($normalizedUrl.StartsWith("git@github.com:")) {
+    $normalizedUrl = "https://github.com/" + $normalizedUrl.Substring("git@github.com:".Length)
+  }
+
+  return "$normalizedUrl/archive/refs/heads/$RepositoryRef.zip"
+}
+
+function Install-FromArchive {
+  param(
+    [Parameter(Mandatory = $true)]
+    [string]$RepositoryUrl,
+    [Parameter(Mandatory = $true)]
+    [string]$TargetDir,
+    [string]$RepositoryRef = "main",
+    [string]$MarkerFile = ""
+  )
+
+  if (Test-Path -LiteralPath $TargetDir -PathType Container) {
+    if (-not [string]::IsNullOrWhiteSpace($MarkerFile) -and (Test-Path -LiteralPath (Join-Path $TargetDir $MarkerFile))) {
+      Write-Host "$TargetDir already exists and is not a Git repository; using it as-is."
+      return
+    }
+    Fail "$TargetDir already exists but is not a recognized installation directory."
+  }
+  elseif (Test-Path -LiteralPath $TargetDir) {
+    Fail "$TargetDir already exists but is not a directory."
+  }
+
+  $archiveUrl = Get-GitHubArchiveUrl -RepositoryUrl $RepositoryUrl -RepositoryRef $RepositoryRef
+  $archiveFile = Join-Path ([System.IO.Path]::GetTempPath()) ("local-immersive-translate-{0}.zip" -f [System.Guid]::NewGuid())
+  $extractDir = Join-Path ([System.IO.Path]::GetTempPath()) ("local-immersive-translate-{0}" -f [System.Guid]::NewGuid())
+
+  Write-Host "git was not found; downloading archive from: $archiveUrl"
+  Invoke-WebRequest -Uri $archiveUrl -OutFile $archiveFile
+  New-Item -ItemType Directory -Force -Path $extractDir | Out-Null
+  Expand-Archive -LiteralPath $archiveFile -DestinationPath $extractDir -Force
+  $extractedRoot = Get-ChildItem -LiteralPath $extractDir -Directory | Select-Object -First 1
+  if ($null -eq $extractedRoot) {
+    Fail "Downloaded archive did not contain a project directory."
+  }
+
+  New-Item -ItemType Directory -Force -Path $TargetDir | Out-Null
+  Copy-Item -Path (Join-Path $extractedRoot.FullName "*") -Destination $TargetDir -Recurse -Force
+  Remove-Item -LiteralPath $archiveFile -Force -ErrorAction SilentlyContinue
+  Remove-Item -LiteralPath $extractDir -Recurse -Force -ErrorAction SilentlyContinue
+}
+
 function Clone-Or-Update {
   param(
     [Parameter(Mandatory = $true)]
     [string]$RepositoryUrl,
     [Parameter(Mandatory = $true)]
     [string]$TargetDir,
-    [string]$RepositoryRef = ""
+    [string]$RepositoryRef = "",
+    [string]$MarkerFile = ""
   )
 
   $gitDir = Join-Path $TargetDir ".git"
+
+  if ($null -eq (Get-Command git -ErrorAction SilentlyContinue)) {
+    $archiveRef = if ([string]::IsNullOrWhiteSpace($RepositoryRef)) { "main" } else { $RepositoryRef }
+    Install-FromArchive -RepositoryUrl $RepositoryUrl -TargetDir $TargetDir -RepositoryRef $archiveRef -MarkerFile $MarkerFile
+    return
+  }
 
   if (Test-Path -LiteralPath $gitDir) {
     $originUrl = Invoke-CaptureChecked -FilePath "git" -Arguments @("-C", $TargetDir, "remote", "get-url", "origin")
@@ -147,7 +210,11 @@ function Clone-Or-Update {
     Invoke-Checked -FilePath "git" -Arguments @("-C", $TargetDir, "pull", "--ff-only")
   }
   elseif (Test-Path -LiteralPath $TargetDir) {
-    Fail "$TargetDir already exists but is not a git repository."
+    if (-not [string]::IsNullOrWhiteSpace($MarkerFile) -and (Test-Path -LiteralPath (Join-Path $TargetDir $MarkerFile))) {
+      Write-Host "$TargetDir already exists and is not a Git repository; using it as-is."
+      return
+    }
+    Fail "$TargetDir already exists but is not a recognized installation directory."
   }
   else {
     Invoke-Checked -FilePath "git" -Arguments @("clone", $RepositoryUrl, $TargetDir)
@@ -160,9 +227,9 @@ function Clone-Or-Update {
 }
 
 try {
-  Require-Command "git"
-
-  Clone-Or-Update -RepositoryUrl $RepoUrl -TargetDir $InstallDir -RepositoryRef $RepoRef
+  if (-not $SkipProjectUpdate -and $env:SKIP_PROJECT_UPDATE -notmatch '^(?i:1|true)$') {
+    Clone-Or-Update -RepositoryUrl $RepoUrl -TargetDir $InstallDir -RepositoryRef $RepoRef -MarkerFile "package.json"
+  }
 
   if ($null -eq (Get-Command uv -ErrorAction SilentlyContinue)) {
     if (-not $AssumeYes) {
@@ -193,7 +260,7 @@ try {
   }
 
   $babelDocDir = Join-Path $InstallDir "BabelDOC"
-  Clone-Or-Update -RepositoryUrl $BabelDocUrl -TargetDir $babelDocDir -RepositoryRef $BabelDocRef
+  Clone-Or-Update -RepositoryUrl $BabelDocUrl -TargetDir $babelDocDir -RepositoryRef $BabelDocRef -MarkerFile "pyproject.toml"
   Invoke-Checked -FilePath "uv" -Arguments @("--directory", $babelDocDir, "sync")
 
   Write-Host ""

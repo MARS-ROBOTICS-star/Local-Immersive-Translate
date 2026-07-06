@@ -3,10 +3,17 @@ import { getPref, setPref } from "../utils/prefs";
 
 const DEFAULT_LOCAL_BACKEND_URL = "http://127.0.0.1:8765/zotero";
 const LOCAL_BACKEND_DIR_NAME = "Local-Immersive-Translate";
+const INSTALL_SCRIPT_BASE_URL =
+  "https://raw.githubusercontent.com/MARS-ROBOTICS-star/Local-Immersive-Translate/main/scripts";
 
 type EnsureLocalBackendResult = {
   ok: boolean;
   started: boolean;
+  message: string;
+};
+
+type InstallLocalBackendResult = {
+  ok: boolean;
   message: string;
 };
 
@@ -191,6 +198,125 @@ function findUvPath(existing: unknown) {
   return existingUvPath || "";
 }
 
+function findExecutableInPath(names: string[]) {
+  for (const name of names) {
+    for (const pathEntry of getPathEntries()) {
+      const executablePath = joinPath(pathEntry, name);
+      if (isReadableExecutable(executablePath)) {
+        return executablePath;
+      }
+    }
+  }
+  return "";
+}
+
+function findFirstExecutable(candidates: string[]) {
+  for (const candidate of candidates) {
+    if (isReadableExecutable(candidate)) {
+      return candidate;
+    }
+  }
+  return "";
+}
+
+function getShellCommand() {
+  if (Zotero.isWin) {
+    const systemRoot =
+      getEnv("SystemRoot") || getEnv("WINDIR") || "C:\\Windows";
+    const powerShellPath =
+      findExecutableInPath(["pwsh.exe", "powershell.exe"]) ||
+      findFirstExecutable([
+        joinPath(
+          systemRoot,
+          "System32",
+          "WindowsPowerShell",
+          "v1.0",
+          "powershell.exe",
+        ),
+      ]);
+    if (!powerShellPath) {
+      throw new Error("PowerShell was not found in PATH.");
+    }
+
+    const scriptUrl = `${INSTALL_SCRIPT_BASE_URL}/install-local-backend.ps1`;
+    const command = [
+      "$ErrorActionPreference = 'Stop'",
+      "$ProgressPreference = 'SilentlyContinue'",
+      "$script = Join-Path ([System.IO.Path]::GetTempPath()) ('local-immersive-translate-install-' + [System.Guid]::NewGuid() + '.ps1')",
+      `Invoke-WebRequest -UseBasicParsing -Uri '${scriptUrl}' -OutFile $script`,
+      "try { & $script -AssumeYes } finally { Remove-Item -LiteralPath $script -Force -ErrorAction SilentlyContinue }",
+    ].join("; ");
+
+    return {
+      executablePath: powerShellPath,
+      args: ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command],
+    };
+  }
+
+  const shellPath =
+    findExecutableInPath(["bash"]) ||
+    findFirstExecutable(["/bin/bash", "/usr/bin/bash", "/usr/local/bin/bash"]);
+  if (!shellPath) {
+    throw new Error("bash was not found in PATH.");
+  }
+
+  const scriptUrl = `${INSTALL_SCRIPT_BASE_URL}/install-local-backend.sh`;
+  const command = [
+    'install_script="$(mktemp "${TMPDIR:-/tmp}/local-immersive-translate-install.XXXXXX.sh")"',
+    `curl -fsSL '${scriptUrl}' -o "$install_script"`,
+    'ASSUME_YES=1 bash "$install_script"',
+    'rm -f "$install_script"',
+  ].join(" && ");
+
+  return {
+    executablePath: shellPath,
+    args: ["-lc", command],
+  };
+}
+
+function runProcessToCompletion(
+  executablePath: string,
+  args: string[],
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const process = (Components.classes as any)[
+      "@mozilla.org/process/util;1"
+    ].createInstance(Components.interfaces.nsIProcess) as nsIProcess;
+    const executableFile = assertExecutablePath(
+      executablePath,
+      "Installer shell",
+    );
+    process.init(executableFile);
+    process.startHidden = true;
+    process.noShell = true;
+    addon.data.localBackendInstallProcess = process;
+
+    const observer = {
+      observe(_subject: any, topic: string) {
+        addon.data.localBackendInstallProcess = undefined;
+        if (topic === "process-finished" && process.exitValue === 0) {
+          resolve();
+          return;
+        }
+        reject(
+          new Error(
+            topic === "process-failed"
+              ? "installer process failed to start"
+              : `installer exited with code ${process.exitValue}`,
+          ),
+        );
+      },
+    };
+
+    try {
+      (process as any).runAsync(args, args.length, observer, false);
+    } catch (error) {
+      addon.data.localBackendInstallProcess = undefined;
+      reject(error);
+    }
+  });
+}
+
 function assertReadablePath(path: string, label: string) {
   const file = pathToFile(path);
   if (!file.exists()) {
@@ -253,6 +379,38 @@ export function normalizeLocalBackendPrefs() {
   }
   if (typeof getPref("localBackendAutoStart") !== "boolean") {
     setPref("localBackendAutoStart", true);
+  }
+}
+
+export async function installOrRepairLocalBackend(): Promise<InstallLocalBackendResult> {
+  if (addon.data.localBackendInstallProcess?.isRunning) {
+    return {
+      ok: false,
+      message: getString("pref-install-already-running"),
+    };
+  }
+
+  try {
+    const { executablePath, args } = getShellCommand();
+    ztoolkit.log("Running Local BabelDOC installer:", executablePath, args);
+    await runProcessToCompletion(executablePath, args);
+
+    setPref("localBackendProjectDir", "");
+    setPref("localBackendUvPath", "");
+    normalizeLocalBackendPrefs();
+
+    return {
+      ok: true,
+      message: getString("pref-install-success"),
+    };
+  } catch (error: any) {
+    ztoolkit.log("Failed to install Local BabelDOC backend:", error);
+    return {
+      ok: false,
+      message: getString("pref-install-failed", {
+        args: { reason: error?.message || String(error) },
+      }),
+    };
   }
 }
 

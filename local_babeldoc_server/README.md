@@ -23,7 +23,21 @@ The installer uses these default locations:
 
 The plugin normally detects these paths automatically. In Zotero preferences, leave the advanced backend fields empty unless you installed the backend somewhere else or automatic detection fails.
 
-Keep `Local service URL` as `http://127.0.0.1:8765/zotero`, fill the model API configuration for the providers you plan to use, then click `Start / Test`.
+In Zotero preferences, click `Install / Repair Local Backend` to deploy or repair the local environment automatically. Then keep `Local service URL` as `http://127.0.0.1:8765/zotero`, fill the model API configuration for the providers you plan to use, and click `Start / Test`.
+
+If you cloned this repository locally, you can also run the installer from the project root:
+
+macOS/Linux:
+
+```bash
+bash install.sh
+```
+
+Windows PowerShell:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\install.ps1
+```
 
 ## Manual Startup
 

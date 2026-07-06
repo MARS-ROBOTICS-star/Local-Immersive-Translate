@@ -25,6 +25,7 @@ class Addon {
     };
     dialog?: DialogHelper;
     localBackendProcess?: any;
+    localBackendInstallProcess?: any;
     task: {
       data?: LargePrefHelper;
       window?: Window;

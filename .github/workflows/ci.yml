@@ -41,10 +41,6 @@ jobs:
     runs-on: ubuntu-latest
     env:
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      OLD_GA_MEASUREMENT_ID: ${{ secrets.OLD_GA_MEASUREMENT_ID }}
-      OLD_GA_API_SECRET: ${{ secrets.OLD_GA_API_SECRET }}
-      NEW_GA_MEASUREMENT_ID: ${{ secrets.NEW_GA_MEASUREMENT_ID }}
-      NEW_GA_API_SECRET: ${{ secrets.NEW_GA_API_SECRET }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -75,3 +71,17 @@ jobs:
           name: build-result
           path: |
             dist
+
+  backend-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run backend tests
+        run: python3 -m unittest discover -s tests -p 'test_*.py'

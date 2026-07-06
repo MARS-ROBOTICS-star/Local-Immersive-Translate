@@ -12,28 +12,29 @@ Local Immersive Translate 是面向 Zotero 7 的本地 PDF 翻译插件。插件
 
 ## 安装
 
+推荐方式：
+
 1. 打开 Releases 页面：<https://github.com/MARS-ROBOTICS-star/Local-Immersive-Translate/releases>
 2. 下载最新版本的 `.xpi` 文件。
 3. 在 Zotero 7 中选择 `Tools` -> `Add-ons` -> `Install Add-on From File...`，选择刚下载的 `.xpi` 文件并安装。
-4. 运行本地后端安装脚本。
+4. 打开插件偏好设置，点击 `安装/修复本地后端`。插件会自动检查并安装本地后端所需环境和依赖。
+5. 在插件 GUI 中填写模型 API 地址、模型名和 API Key，然后点击 `Start / Test`。
+
+如果你已经 clone 了本项目，也可以在项目根目录运行一行命令部署本地后端。
 
 macOS/Linux:
 
 ```bash
-curl -fsSLO https://raw.githubusercontent.com/MARS-ROBOTICS-star/Local-Immersive-Translate/main/scripts/install-local-backend.sh
-bash install-local-backend.sh
+bash install.sh
 ```
 
 Windows PowerShell:
 
 ```powershell
-Invoke-WebRequest https://raw.githubusercontent.com/MARS-ROBOTICS-star/Local-Immersive-Translate/main/scripts/install-local-backend.ps1 -OutFile install-local-backend.ps1
-powershell -ExecutionPolicy Bypass -File .\install-local-backend.ps1
+powershell -ExecutionPolicy Bypass -File .\install.ps1
 ```
 
-5. 打开 Zotero 插件偏好设置，填写模型 API 配置，然后点击 `Start / Test`。
-
-如果系统尚未安装 `uv`，安装脚本会先提示确认，然后再下载并执行官方 `uv` 安装器。
+安装器会自动检查 `uv`、项目目录、BabelDOC 和 Python 依赖。通过插件 GUI 触发安装时，用户点击按钮即表示授权安装器自动完成这些步骤。
 
 ## 使用
 
@@ -69,7 +70,7 @@ powershell -ExecutionPolicy Bypass -File .\install-local-backend.ps1
 
 ### 点击 Start / Test 失败怎么办？
 
-请确认本地后端安装脚本已经运行完成，偏好设置中的项目目录和 `uv` 路径正确，且当前模型 API 配置可用。
+请先在插件偏好设置中点击 `安装/修复本地后端`，然后确认模型 API 地址、API Key 和模型名正确。
 
 ### 翻译失败怎么办？
 

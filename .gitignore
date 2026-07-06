@@ -24,4 +24,5 @@ dist
 # Local BabelDOC backend
 BabelDOC/
 .local-babeldoc
+translated/
 local_babeldoc_server/config.local.json
