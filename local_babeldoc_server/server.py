@@ -421,6 +421,7 @@ class AppState:
             ),
             send_temperature=bool(babeldoc_cfg.get("send_temperature", True)),
             reasoning=model_cfg.get("reasoning"),
+            thinking=model_cfg.get("thinking"),
         )
 
     def _run_babeldoc(self, pdf_id: str) -> None:

@@ -43,7 +43,8 @@
       "label": "DeepSeek",
       "base_url": "",
       "api_key": "env:DEEPSEEK_API_KEY",
-      "model": ""
+      "model": "",
+      "thinking": "disabled"
     },
     "glm-paid-1": {
       "label": "GLM 4.7",

@@ -1,8 +1,14 @@
+import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from local_babeldoc_server.server import AppState
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
 def make_config(data_dir: Path) -> dict:
@@ -20,6 +26,11 @@ def make_config(data_dir: Path) -> dict:
         },
         "models": {},
     }
+
+
+class FakeOpenAITranslator:
+    def __init__(self, **kwargs) -> None:
+        self.kwargs = kwargs
 
 
 class AppStateRecoveryTest(unittest.TestCase):
@@ -45,6 +56,55 @@ class AppStateRecoveryTest(unittest.TestCase):
             self.assertEqual(job.translation_pdf_path, str(mono_path))
             self.assertEqual(job.dual_pdf_path, str(dual_path))
             self.assertIs(state.get_job(pdf_id), job)
+
+
+class AppStateTranslatorTest(unittest.TestCase):
+    def test_passes_thinking_option_to_babeldoc(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = make_config(Path(temp_dir))
+            config["models"]["deepseek"] = {
+                "base_url": "https://api.deepseek.example/v1",
+                "api_key": "test-key",
+                "model": "deepseek-chat",
+                "thinking": "enabled",
+            }
+            state = AppState(config)
+
+            babeldoc_module = types.ModuleType("babeldoc")
+            babeldoc_module.__path__ = []
+            translator_package = types.ModuleType("babeldoc.translator")
+            translator_package.__path__ = []
+            translator_module = types.ModuleType("babeldoc.translator.translator")
+            translator_module.OpenAITranslator = FakeOpenAITranslator
+
+            with patch.dict(
+                sys.modules,
+                {
+                    "babeldoc": babeldoc_module,
+                    "babeldoc.translator": translator_package,
+                    "babeldoc.translator.translator": translator_module,
+                },
+            ):
+                translator = state._create_translator("deepseek", "zh")
+
+            self.assertEqual(translator.kwargs["thinking"], "enabled")
+
+
+class InstallerVersionTest(unittest.TestCase):
+    def test_pins_babeldoc_v0_6_4_on_all_platforms(self) -> None:
+        bash_installer = (
+            PROJECT_ROOT / "scripts" / "install-local-backend.sh"
+        ).read_text(encoding="utf-8")
+        powershell_installer = (
+            PROJECT_ROOT / "scripts" / "install-local-backend.ps1"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn(
+            'BABELDOC_REF="${BABELDOC_REF:-v0.6.4}"', bash_installer
+        )
+        self.assertIn(
+            '[string]$BabelDocRef = "v0.6.4"', powershell_installer
+        )
 
 
 if __name__ == "__main__":

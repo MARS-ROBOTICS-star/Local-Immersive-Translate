@@ -2,6 +2,8 @@
 
 This folder contains the local backend used by the Zotero plugin. It exposes a Zotero-compatible API, runs BabelDOC on this machine, and returns translated PDF files to the plugin.
 
+Local Immersive Translate v0.0.25 uses and pins BabelDOC v0.6.4. Run the installer again, or click `Install / Repair Local Backend` in Zotero preferences, to update an existing checkout to the supported version.
+
 ## What It Provides
 
 - `GET /zotero/check-key`
@@ -84,6 +86,8 @@ For each model you want to call, fill these fields in the Zotero plugin UI:
 The plugin sends only the selected model's configuration with each translation task. Defaults are intentionally empty, so users must provide their own model API settings.
 
 When configuring models in JSON instead of the plugin UI, `api_key` can be a literal key or `env:VARIABLE_NAME`.
+
+For DeepSeek-compatible APIs, the model JSON can also include `"thinking": "enabled"` or `"thinking": "disabled"`. This is an advanced backend-only setting and does not change the Zotero preferences UI.
 
 ## Notes
 

@@ -47,6 +47,8 @@ powershell -ExecutionPolicy Bypass -File .\install.ps1
 
 本插件后端基于 [BabelDOC](https://github.com/funstory-ai/BabelDOC)。BabelDOC 负责 PDF 解析、版面保持和翻译文件生成，本项目提供 Zotero 插件界面、本地服务封装和跨平台安装脚本。
 
+Local Immersive Translate v0.0.25 默认使用并锁定 BabelDOC v0.6.4。已有安装可在插件偏好设置中再次点击 `安装/修复本地后端`，将本地 BabelDOC 更新到当前支持的版本。
+
 默认安装路径：
 
 - Windows: `%USERPROFILE%\Local-Immersive-Translate`

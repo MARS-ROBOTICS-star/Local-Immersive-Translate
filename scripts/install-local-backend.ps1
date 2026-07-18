@@ -3,7 +3,7 @@ param(
   [string]$InstallDir = (Join-Path $env:USERPROFILE "Local-Immersive-Translate"),
   [string]$BabelDocUrl = "https://github.com/funstory-ai/BabelDOC.git",
   [string]$RepoRef = "",
-  [string]$BabelDocRef = "",
+  [string]$BabelDocRef = "v0.6.4",
   [switch]$AssumeYes,
   [switch]$SkipProjectUpdate,
   [string]$UvInstallUrl = "https://astral.sh/uv/install.ps1"
