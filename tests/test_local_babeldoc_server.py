@@ -1,8 +1,10 @@
+import asyncio
 import sys
 import tempfile
 import types
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from local_babeldoc_server.server import AppState
@@ -88,6 +90,34 @@ class AppStateTranslatorTest(unittest.TestCase):
                 translator = state._create_translator("deepseek", "zh")
 
             self.assertEqual(translator.kwargs["thinking"], "enabled")
+
+
+class AppStateTranslateEventsTest(unittest.TestCase):
+    def test_returns_finish_result_without_waiting_for_stream_to_close(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = AppState(make_config(Path(temp_dir)))
+            expected_result = object()
+
+            async def stream_stuck_after_finish(_config):
+                yield {
+                    "type": "finish",
+                    "translate_result": expected_result,
+                }
+                await asyncio.Event().wait()
+
+            async def consume():
+                return await asyncio.wait_for(
+                    state._consume_translate_events(
+                        "938d971b76364e04b9939ec3dd01ae8c",
+                        stream_stuck_after_finish,
+                        SimpleNamespace(output_dir=temp_dir),
+                    ),
+                    timeout=0.1,
+                )
+
+            result = asyncio.run(consume())
+
+            self.assertIs(result, expected_result)
 
 
 class InstallerVersionTest(unittest.TestCase):

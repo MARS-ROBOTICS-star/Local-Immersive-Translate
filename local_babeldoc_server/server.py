@@ -547,7 +547,6 @@ class AppState:
         )
 
     async def _consume_translate_events(self, pdf_id: str, async_translate, config):
-        result = None
         async for event in async_translate(config):
             event_type = event.get("type")
             if event_type in {"progress_start", "progress_update", "progress_end"}:
@@ -572,9 +571,10 @@ class AppState:
                 raise RuntimeError(str(event.get("error") or "BabelDOC error"))
             elif event_type == "finish":
                 result = event.get("translate_result")
-        if result is None:
-            raise RuntimeError("BabelDOC finished without a result")
-        return result
+                if result is None:
+                    raise RuntimeError("BabelDOC finished without a result")
+                return result
+        raise RuntimeError("BabelDOC finished without a result")
 
     def _make_result_from_output_dir(self, output_dir: str | Path):
         output_path = Path(output_dir)
