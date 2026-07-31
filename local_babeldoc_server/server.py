@@ -102,6 +102,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "skip_form_render": False,
         "skip_curve_render": False,
         "remove_non_formula_lines": False,
+        "enable_native_table_translation": True,
+        "enable_table_ocr": True,
+        "preserve_references": True,
+        "preserve_toc_layout": True,
     },
     "models": MODEL_DEFAULTS,
 }
@@ -237,6 +241,10 @@ class AppState:
         self.jobs_lock = threading.RLock()
         self.doc_layout_model = None
         self.doc_layout_lock = threading.Lock()
+        self.babeldoc_compat_handle = None
+        self.babeldoc_compat_lock = threading.Lock()
+        self.table_ocr_runtime = None
+        self.table_ocr_lock = threading.Lock()
         self.babeldoc_repo = resolve_repo_relative_path(babeldoc_cfg["repo_path"])
         if self.babeldoc_repo.exists():
             sys.path.insert(0, str(self.babeldoc_repo))
@@ -363,6 +371,30 @@ class AppState:
             self.doc_layout_model = DocLayoutModel.load_onnx()
             return self.doc_layout_model
 
+    def _get_table_ocr_runtime(self):
+        if not self.config["babeldoc"].get("enable_table_ocr", True):
+            return None
+        with self.table_ocr_lock:
+            if self.table_ocr_runtime is None:
+                from local_babeldoc_server.table_ocr import TableOcrRuntime
+                from local_babeldoc_server.table_ocr import create_rapidocr_engine
+
+                self.table_ocr_runtime = TableOcrRuntime(create_rapidocr_engine)
+            return self.table_ocr_runtime
+
+    def _ensure_babeldoc_compat(self) -> None:
+        with self.babeldoc_compat_lock:
+            if self.babeldoc_compat_handle is not None:
+                return
+            from local_babeldoc_server.babeldoc_compat import (
+                install_babeldoc_compat,
+            )
+
+            self.babeldoc_compat_handle = install_babeldoc_compat(
+                self.config["babeldoc"],
+                self._get_table_ocr_runtime(),
+            )
+
     def _create_translator(
         self,
         model_key: str,
@@ -425,6 +457,7 @@ class AppState:
         )
 
     def _run_babeldoc(self, pdf_id: str) -> None:
+        self._ensure_babeldoc_compat()
         from babeldoc.format.pdf.high_level import async_translate
         from babeldoc.format.pdf.translation_config import TranslationConfig
         from babeldoc.format.pdf.translation_config import WatermarkOutputMode

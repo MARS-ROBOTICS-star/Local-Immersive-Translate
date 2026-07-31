@@ -24,7 +24,11 @@
     "skip_scanned_detection": false,
     "skip_form_render": false,
     "skip_curve_render": false,
-    "remove_non_formula_lines": false
+    "remove_non_formula_lines": false,
+    "enable_native_table_translation": true,
+    "enable_table_ocr": true,
+    "preserve_references": true,
+    "preserve_toc_layout": true
   },
   "models": {
     "kimi": {

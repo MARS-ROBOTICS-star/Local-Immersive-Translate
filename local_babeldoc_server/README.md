@@ -4,6 +4,12 @@ This folder contains the local backend used by the Zotero plugin. It exposes a Z
 
 Local Immersive Translate v0.0.25 uses and pins BabelDOC v0.6.4. Run the installer again, or click `Install / Repair Local Backend` in Zotero preferences, to update an existing checkout to the supported version.
 
+The backend also applies structure-aware PDF repairs by default: native table
+text remains translatable, table regions without enough extractable text use
+RapidOCR, `References` / `Bibliography` headings and entries remain in the
+source language, and table-of-contents entries translate only their titles
+while retaining numbering, dot leaders, indentation, and page numbers.
+
 ## What It Provides
 
 - `GET /zotero/check-key`
@@ -92,4 +98,6 @@ For DeepSeek-compatible APIs, the model JSON can also include `"thinking": "enab
 ## Notes
 
 - The local backend generates both translation-only and dual-language PDFs so the plugin's `dual`, `translation`, and `all` modes continue to work.
+- Table OCR is region-scoped and lazy at runtime. The installer installs and prewarms RapidOCR; rerun `Install / Repair Local Backend` if an existing installation reports that RapidOCR is missing.
+- Advanced JSON configuration can disable individual repairs with `enable_table_ocr`, `preserve_references`, or `preserve_toc_layout` under `babeldoc`.
 - BabelDOC is AGPL-3.0. Local personal use is straightforward; redistribution or providing a network service has source-code obligations.

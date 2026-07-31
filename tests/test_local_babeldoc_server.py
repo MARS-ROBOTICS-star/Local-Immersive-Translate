@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from local_babeldoc_server.server import AppState
+from local_babeldoc_server.server import load_config
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -58,6 +59,35 @@ class AppStateRecoveryTest(unittest.TestCase):
             self.assertEqual(job.translation_pdf_path, str(mono_path))
             self.assertEqual(job.dual_pdf_path, str(dual_path))
             self.assertIs(state.get_job(pdf_id), job)
+
+
+class StructureRepairConfigTest(unittest.TestCase):
+    def test_default_config_enables_all_structure_repairs(self) -> None:
+        babeldoc = load_config(None)["babeldoc"]
+
+        self.assertIs(babeldoc["enable_native_table_translation"], True)
+        self.assertIs(babeldoc["enable_table_ocr"], True)
+        self.assertIs(babeldoc["preserve_references"], True)
+        self.assertIs(babeldoc["preserve_toc_layout"], True)
+
+    def test_table_ocr_runtime_is_lazy_reused_and_can_be_disabled(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = make_config(Path(temp_dir))
+            config["babeldoc"]["enable_table_ocr"] = True
+            state = AppState(config)
+
+            first = state._get_table_ocr_runtime()
+            second = state._get_table_ocr_runtime()
+
+            self.assertIs(first, second)
+            self.assertIsNone(first._engine_instance)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = make_config(Path(temp_dir))
+            config["babeldoc"]["enable_table_ocr"] = False
+            state = AppState(config)
+
+            self.assertIsNone(state._get_table_ocr_runtime())
 
 
 class AppStateTranslatorTest(unittest.TestCase):
@@ -135,6 +165,23 @@ class InstallerVersionTest(unittest.TestCase):
         self.assertIn(
             '[string]$BabelDocRef = "v0.6.4"', powershell_installer
         )
+
+    def test_installs_and_prewarms_table_ocr_dependency_on_all_platforms(self) -> None:
+        bash_installer = (
+            PROJECT_ROOT / "scripts" / "install-local-backend.sh"
+        ).read_text(encoding="utf-8")
+        powershell_installer = (
+            PROJECT_ROOT / "scripts" / "install-local-backend.ps1"
+        ).read_text(encoding="utf-8")
+        requirements = (
+            PROJECT_ROOT / "local_babeldoc_server" / "requirements.txt"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("rapidocr>=3.4,<4", requirements)
+        self.assertIn("local_babeldoc_server/requirements.txt", bash_installer)
+        self.assertIn("from rapidocr import RapidOCR; RapidOCR()", bash_installer)
+        self.assertIn("local_babeldoc_server\\requirements.txt", powershell_installer)
+        self.assertIn("from rapidocr import RapidOCR; RapidOCR()", powershell_installer)
 
 
 if __name__ == "__main__":
