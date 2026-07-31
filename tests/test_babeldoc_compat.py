@@ -62,6 +62,14 @@ class FakeILTranslator:
         def set_original_placeholder_tokens(self, tokens):
             self.original_placeholder_tokens = tokens
 
+    def __init__(self):
+        self.translation_config = SimpleNamespace(
+            lang_out="zh",
+            translation_retry_chunk_sizes=[700, 350],
+        )
+        self.translate_engine = None
+        self.initial_output = None
+
     def pre_translate_paragraph(
         self, paragraph, tracker, page_font_map, xobj_font_map
     ):
@@ -69,6 +77,36 @@ class FakeILTranslator:
 
     def translate_paragraph(self, paragraph, *args, **kwargs):
         paragraph.used_original_translation = True
+        tracker = kwargs.get("tracker")
+        if tracker is not None and self.initial_output is not None:
+            translate_input = self.TranslateInput(
+                paragraph.unicode,
+                [],
+                paragraph.pdf_style,
+            )
+            self.post_translate_paragraph(
+                paragraph,
+                tracker,
+                translate_input,
+                self.initial_output,
+            )
+
+    def generate_prompt_for_llm(
+        self,
+        text,
+        title_paragraph=None,
+        local_title_paragraph=None,
+        translate_input=None,
+    ):
+        return text
+
+    def post_translate_paragraph(
+        self, paragraph, tracker, translate_input, translated_text
+    ):
+        tracker.set_output(translated_text)
+        paragraph.unicode = translated_text
+        paragraph.pdf_paragraph_composition = []
+        return True
 
 
 class FakeLayoutParser:
@@ -176,6 +214,16 @@ class FakeTranslateEngine:
         return self.output
 
 
+class FakeQueuedLLMEngine:
+    def __init__(self, outputs):
+        self.outputs = list(outputs)
+        self.inputs = []
+
+    def llm_translate(self, text, rate_limit_params=None):
+        self.inputs.append(text)
+        return self.outputs.pop(0) if self.outputs else ""
+
+
 class FakeOcrRuntime:
     def __init__(self, blocks):
         self.blocks = blocks
@@ -190,6 +238,102 @@ class FakeOcrRuntime:
 
 
 class BabeldocCompatTest(unittest.TestCase):
+    def test_empty_translation_never_replaces_source(self):
+        modules = fake_modules()
+        source = paragraph("Mobile robots navigate autonomously.")
+        original_composition = object()
+        source.pdf_paragraph_composition = [original_composition]
+        tracker = FakeTracker()
+        translate_input = FakeILTranslator.TranslateInput(
+            source.unicode,
+            [],
+            source.pdf_style,
+        )
+
+        with patch.dict(sys.modules, modules):
+            handle = install_babeldoc_compat(
+                {"preserve_references": True, "preserve_toc_layout": True}
+            )
+            result = FakeILTranslator().post_translate_paragraph(
+                source,
+                tracker,
+                translate_input,
+                "  \n",
+            )
+            handle.restore()
+
+        self.assertFalse(result)
+        self.assertEqual(source.unicode, "Mobile robots navigate autonomously.")
+        self.assertEqual(source.pdf_paragraph_composition, [original_composition])
+
+    def test_rejected_translation_is_recovered_from_validated_chunks(self):
+        modules = fake_modules()
+        source = paragraph(
+            "First sentence explains robot navigation. "
+            "Second sentence explains sensor fusion."
+        )
+        tracker = FakeTracker()
+        translator = FakeILTranslator()
+        translator.initial_output = ""
+        translator.translation_config.translation_retry_chunk_sizes = [48]
+        translator.translate_engine = FakeQueuedLLMEngine(
+            ["第一句解释机器人导航。", "第二句解释传感器融合。"]
+        )
+
+        with patch.dict(sys.modules, modules):
+            handle = install_babeldoc_compat(
+                {"preserve_references": True, "preserve_toc_layout": True}
+            )
+            translator.translate_paragraph(source, tracker=tracker)
+            handle.restore()
+
+        self.assertEqual(
+            source.unicode,
+            "第一句解释机器人导航。 第二句解释传感器融合。",
+        )
+        self.assertEqual(
+            translator.translate_engine.inputs,
+            [
+                "First sentence explains robot navigation.",
+                "Second sentence explains sensor fusion.",
+            ],
+        )
+        quality = translator.translation_config.local_translation_quality
+        self.assertEqual(quality["recovered_count"], 1)
+        self.assertEqual(quality["unresolved_count"], 0)
+
+    def test_retry_exhaustion_preserves_original_composition_and_records_failure(self):
+        modules = fake_modules()
+        source = paragraph(
+            "A long source paragraph describes autonomous navigation and "
+            "sensor fusion without losing any original content."
+        )
+        original_composition = object()
+        source.pdf_paragraph_composition = [original_composition]
+        tracker = FakeTracker()
+        translator = FakeILTranslator()
+        translator.initial_output = ""
+        translator.translation_config.translation_retry_chunk_sizes = [60, 30]
+        translator.translate_engine = FakeQueuedLLMEngine([""] * 8)
+
+        with patch.dict(sys.modules, modules):
+            handle = install_babeldoc_compat(
+                {"preserve_references": True, "preserve_toc_layout": True}
+            )
+            translator.translate_paragraph(source, tracker=tracker)
+            handle.restore()
+
+        self.assertEqual(
+            source.unicode,
+            "A long source paragraph describes autonomous navigation and "
+            "sensor fusion without losing any original content.",
+        )
+        self.assertEqual(source.pdf_paragraph_composition, [original_composition])
+        quality = translator.translation_config.local_translation_quality
+        self.assertEqual(quality["recovered_count"], 0)
+        self.assertEqual(quality["unresolved_count"], 1)
+        self.assertIn("empty_target", quality["unresolved"][0]["reasons"])
+
     def test_installs_once_marks_structure_and_restores_original_methods(self):
         modules = fake_modules()
         original_process = FakeParagraphFinder.process

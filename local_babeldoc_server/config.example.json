@@ -28,7 +28,10 @@
     "enable_native_table_translation": true,
     "enable_table_ocr": true,
     "preserve_references": true,
-    "preserve_toc_layout": true
+    "preserve_toc_layout": true,
+    "enable_translation_quality_guard": true,
+    "translation_retry_chunk_sizes": [700, 350],
+    "fail_on_unresolved_translation": true
   },
   "models": {
     "kimi": {

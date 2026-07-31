@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 from dataclasses import dataclass, field
 from importlib import import_module
 from typing import Any
@@ -11,6 +12,8 @@ from local_babeldoc_server.structure_rules import display_width
 from local_babeldoc_server.structure_rules import mark_document_structure
 from local_babeldoc_server.structure_rules import parse_toc_entry
 from local_babeldoc_server.structure_rules import rebuild_toc_entry
+from local_babeldoc_server.translation_quality import validate_translation
+from local_babeldoc_server.translation_quality import split_translation_chunks
 
 
 logger = logging.getLogger(__name__)
@@ -37,6 +40,45 @@ class TableStats:
     table_regions: int = 0
     ocr_table_regions: int = 0
     ocr_text_blocks: int = 0
+
+
+def _translation_quality_state(translation_config: Any) -> tuple[dict[str, Any], Any]:
+    state = getattr(translation_config, "local_translation_quality", None)
+    lock = getattr(translation_config, "local_translation_quality_lock", None)
+    if state is None:
+        state = {
+            "rejected_count": 0,
+            "recovered_count": 0,
+            "unresolved_count": 0,
+            "recovered": [],
+            "unresolved": [],
+        }
+        setattr(translation_config, "local_translation_quality", state)
+    if lock is None:
+        lock = threading.Lock()
+        setattr(translation_config, "local_translation_quality_lock", lock)
+    return state, lock
+
+
+def _record_quality_event(
+    translation_config: Any,
+    kind: str,
+    paragraph: Any,
+    source_text: str,
+    reasons: tuple[str, ...] = (),
+) -> None:
+    state, lock = _translation_quality_state(translation_config)
+    record = {
+        "paragraph_id": getattr(paragraph, "debug_id", None),
+        "source_preview": source_text[:240],
+        "reasons": list(reasons),
+    }
+    with lock:
+        if kind == "rejected":
+            state["rejected_count"] += 1
+            return
+        state[f"{kind}_count"] += 1
+        state[kind].append(record)
 
 
 def _require_supported_babeldoc() -> None:
@@ -246,11 +288,13 @@ def install_babeldoc_compat(
     original_process = paragraph_finder.process
     original_pre_translate = il_translator.pre_translate_paragraph
     original_translate = il_translator.translate_paragraph
+    original_post_translate = il_translator.post_translate_paragraph
     handle.originals.extend(
         [
             (paragraph_finder, "process", original_process),
             (il_translator, "pre_translate_paragraph", original_pre_translate),
             (il_translator, "translate_paragraph", original_translate),
+            (il_translator, "post_translate_paragraph", original_post_translate),
         ]
     )
     original_layout_process = None
@@ -274,6 +318,9 @@ def install_babeldoc_compat(
 
     preserve_references = bool(config.get("preserve_references", True))
     preserve_toc_layout = bool(config.get("preserve_toc_layout", True))
+    quality_guard_enabled = bool(
+        config.get("enable_translation_quality_guard", True)
+    )
 
     def wrapped_process(self, document):
         result = original_process(self, document)
@@ -334,7 +381,163 @@ def install_babeldoc_compat(
                 tracker = args[2]
             if translate_toc_paragraph(self, paragraph, tracker):
                 return None
-        return original_translate(self, paragraph, *args, **kwargs)
+        result = original_translate(self, paragraph, *args, **kwargs)
+        tracker = kwargs.get("tracker")
+        if tracker is None and len(args) >= 3:
+            tracker = args[2]
+        rejection = getattr(tracker, "local_translation_rejection", None)
+        if not rejection:
+            return result
+
+        source_text = getattr(tracker, "local_translation_source", "") or ""
+        translate_input = getattr(tracker, "local_translate_input", None)
+        if not source_text or translate_input is None:
+            _call_tracker(tracker, "set_output", source_text)
+            _record_quality_event(
+                self.translation_config,
+                "unresolved",
+                paragraph,
+                source_text,
+                tuple(rejection),
+            )
+            return result
+
+        title_paragraph = kwargs.get("title_paragraph")
+        local_title_paragraph = kwargs.get("local_title_paragraph")
+        if title_paragraph is None and len(args) >= 7:
+            title_paragraph = args[6]
+        if local_title_paragraph is None and len(args) >= 8:
+            local_title_paragraph = args[7]
+
+        retry_sizes = getattr(
+            self.translation_config,
+            "translation_retry_chunk_sizes",
+            config.get("translation_retry_chunk_sizes", [700, 350]),
+        )
+        last_reasons = tuple(rejection)
+        for chunk_size in retry_sizes:
+            chunks = split_translation_chunks(source_text, int(chunk_size))
+            translated_chunks = []
+            chunk_failed = False
+            for chunk in chunks:
+                prompt = self.generate_prompt_for_llm(
+                    chunk,
+                    title_paragraph,
+                    local_title_paragraph,
+                    None,
+                )
+                llm_tracker = None
+                tracker_factory = getattr(tracker, "new_llm_translate_tracker", None)
+                if callable(tracker_factory):
+                    llm_tracker = tracker_factory()
+                    _call_tracker(llm_tracker, "set_input", prompt)
+                translated_chunk = self.translate_engine.llm_translate(
+                    prompt,
+                    rate_limit_params={"paragraph_token_count": len(chunk)},
+                )
+                translated_chunk = translated_chunk or ""
+                if llm_tracker is not None:
+                    _call_tracker(llm_tracker, "set_output", translated_chunk)
+                validation = validate_translation(
+                    chunk,
+                    translated_chunk,
+                    getattr(self.translation_config, "lang_out", "zh"),
+                )
+                if not validation.accepted:
+                    last_reasons = validation.reasons
+                    if llm_tracker is not None:
+                        _call_tracker(
+                            llm_tracker,
+                            "set_error_message",
+                            ", ".join(validation.reasons),
+                        )
+                    chunk_failed = True
+                    break
+                translated_chunks.append(translated_chunk.strip())
+            if chunk_failed or not translated_chunks:
+                continue
+
+            combined = " ".join(translated_chunks)
+            combined_validation = validate_translation(
+                source_text,
+                combined,
+                getattr(self.translation_config, "lang_out", "zh"),
+            )
+            if not combined_validation.accepted:
+                last_reasons = combined_validation.reasons
+                continue
+
+            setattr(tracker, "local_translation_rejection", ())
+            applied = original_post_translate(
+                self,
+                paragraph,
+                tracker,
+                translate_input,
+                combined,
+            )
+            _record_quality_event(
+                self.translation_config,
+                "recovered",
+                paragraph,
+                source_text,
+            )
+            return applied
+
+        _call_tracker(tracker, "set_output", source_text)
+        _record_quality_event(
+            self.translation_config,
+            "unresolved",
+            paragraph,
+            source_text,
+            last_reasons,
+        )
+        return result
+
+    def wrapped_post_translate(
+        self,
+        paragraph,
+        tracker,
+        translate_input,
+        translated_text,
+    ):
+        if not quality_guard_enabled:
+            return original_post_translate(
+                self,
+                paragraph,
+                tracker,
+                translate_input,
+                translated_text,
+            )
+        source_text = getattr(translate_input, "unicode", "") or ""
+        target_language = getattr(
+            getattr(self, "translation_config", None),
+            "lang_out",
+            "zh",
+        )
+        validation = validate_translation(
+            source_text,
+            translated_text,
+            target_language,
+        )
+        if not validation.accepted:
+            setattr(tracker, "local_translation_rejection", validation.reasons)
+            setattr(tracker, "local_translation_source", source_text)
+            setattr(tracker, "local_translate_input", translate_input)
+            _record_quality_event(
+                self.translation_config,
+                "rejected",
+                paragraph,
+                source_text,
+                validation.reasons,
+            )
+            return False
+        return original_post_translate(
+            self,
+            paragraph,
+            tracker,
+            translate_input,
+            translated_text,
+        )
 
     if table_ocr_enabled:
 
@@ -400,7 +603,9 @@ def install_babeldoc_compat(
     setattr(wrapped_process, PATCH_MARKER, True)
     setattr(wrapped_pre_translate, PATCH_MARKER, True)
     setattr(wrapped_translate, PATCH_MARKER, True)
+    setattr(wrapped_post_translate, PATCH_MARKER, True)
     paragraph_finder.process = wrapped_process
     il_translator.pre_translate_paragraph = wrapped_pre_translate
     il_translator.translate_paragraph = wrapped_translate
+    il_translator.post_translate_paragraph = wrapped_post_translate
     return handle

@@ -8,6 +8,9 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from local_babeldoc_server.server import AppState
+from local_babeldoc_server.server import TranslationCompletenessError
+from local_babeldoc_server.server import audit_translation_completion
+from local_babeldoc_server.server import ensure_translation_complete
 from local_babeldoc_server.server import load_config
 
 
@@ -69,6 +72,9 @@ class StructureRepairConfigTest(unittest.TestCase):
         self.assertIs(babeldoc["enable_table_ocr"], True)
         self.assertIs(babeldoc["preserve_references"], True)
         self.assertIs(babeldoc["preserve_toc_layout"], True)
+        self.assertIs(babeldoc["enable_translation_quality_guard"], True)
+        self.assertEqual(babeldoc["translation_retry_chunk_sizes"], [700, 350])
+        self.assertIs(babeldoc["fail_on_unresolved_translation"], True)
 
     def test_table_ocr_runtime_is_lazy_reused_and_can_be_disabled(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -148,6 +154,105 @@ class AppStateTranslateEventsTest(unittest.TestCase):
             result = asyncio.run(consume())
 
             self.assertIs(result, expected_result)
+
+
+class TranslationCompletionAuditTest(unittest.TestCase):
+    def test_detects_empty_and_unchanged_attempted_translations_but_skips_references(self) -> None:
+        tracking = {
+            "page": [
+                {
+                    "paragraph": [
+                        {
+                            "input": "Mobile robots navigate autonomously.",
+                            "output": "",
+                        },
+                        {
+                            "input": (
+                                "Sensor fusion combines measurements from several "
+                                "devices to improve estimation accuracy."
+                            ),
+                            "output": (
+                                "Sensor fusion combines measurements from several "
+                                "devices to improve estimation accuracy."
+                            ),
+                        },
+                        {"input": "REFERENCES", "output": None},
+                        {
+                            "input": "[1] D. Di Paola, An autonomous mobile robot.",
+                            "output": None,
+                        },
+                    ]
+                }
+            ],
+            "cross_page": [],
+            "cross_column": [],
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            tracking_path = Path(temp_dir) / "translate_tracking.json"
+            tracking_path.write_text(__import__("json").dumps(tracking), encoding="utf-8")
+
+            audit = audit_translation_completion(Path(temp_dir), None, "zh")
+
+        self.assertEqual(audit.attempted_count, 2)
+        self.assertEqual(audit.empty_replacement_count, 1)
+        self.assertEqual(audit.unresolved_count, 2)
+        self.assertEqual(audit.reference_excluded_count, 2)
+
+    def test_merges_local_recovery_counts_without_double_counting_unresolved_rows(self) -> None:
+        tracking = {
+            "page": [
+                {
+                    "paragraph": [
+                        {
+                            "input": "A paragraph that failed translation completely.",
+                            "output": (
+                                "A paragraph that failed translation completely."
+                            ),
+                        },
+                        {
+                            "input": "A recovered paragraph.",
+                            "output": "一个已恢复的段落。",
+                        },
+                    ]
+                }
+            ],
+            "cross_page": [],
+            "cross_column": [],
+        }
+        local_quality = {
+            "recovered_count": 1,
+            "unresolved_count": 1,
+            "unresolved": [
+                {
+                    "paragraph_id": "p1",
+                    "source_preview": "A paragraph that failed translation completely.",
+                    "reasons": ["empty_target"],
+                }
+            ],
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            tracking_path = Path(temp_dir) / "translate_tracking.json"
+            tracking_path.write_text(__import__("json").dumps(tracking), encoding="utf-8")
+
+            audit = audit_translation_completion(
+                Path(temp_dir), local_quality, "zh"
+            )
+
+        self.assertEqual(audit.recovered_count, 1)
+        self.assertEqual(audit.unresolved_count, 1)
+
+    def test_unresolved_audit_cannot_be_marked_as_success(self) -> None:
+        audit = SimpleNamespace(
+            unresolved_count=3,
+            empty_replacement_count=0,
+            protected_token_mismatch_count=0,
+        )
+
+        with self.assertRaisesRegex(
+            TranslationCompletenessError,
+            "3 unresolved translatable paragraphs",
+        ):
+            ensure_translation_complete(audit, fail_on_unresolved=True)
 
 
 class InstallerVersionTest(unittest.TestCase):

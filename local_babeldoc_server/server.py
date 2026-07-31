@@ -7,6 +7,7 @@ import json
 import logging
 import mimetypes
 import os
+import re
 import shutil
 import sys
 import threading
@@ -25,6 +26,8 @@ from urllib.parse import quote
 from urllib.parse import unquote
 from urllib.parse import urlencode
 from urllib.parse import urlparse
+
+from local_babeldoc_server.translation_quality import validate_translation
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DATA_DIR = REPO_ROOT / ".local-babeldoc"
@@ -106,11 +109,138 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "enable_table_ocr": True,
         "preserve_references": True,
         "preserve_toc_layout": True,
+        "enable_translation_quality_guard": True,
+        "translation_retry_chunk_sizes": [700, 350],
+        "fail_on_unresolved_translation": True,
     },
     "models": MODEL_DEFAULTS,
 }
 
 logger = logging.getLogger("local_babeldoc_server")
+
+
+class TranslationCompletenessError(RuntimeError):
+    pass
+
+
+@dataclass(frozen=True)
+class TranslationAudit:
+    attempted_count: int = 0
+    accepted_count: int = 0
+    recovered_count: int = 0
+    unresolved_count: int = 0
+    empty_replacement_count: int = 0
+    protected_token_mismatch_count: int = 0
+    reference_excluded_count: int = 0
+    unresolved: tuple[dict[str, Any], ...] = ()
+
+
+_REFERENCE_HEADING_RE = re.compile(
+    r"^\s*(references|bibliography|works\s+cited|literature\s+cited)\s*$",
+    re.IGNORECASE,
+)
+_REFERENCE_ENTRY_RE = re.compile(r"^\s*\[\s*\d+\s*]\s+\S+")
+
+
+def _is_reference_like(text: str) -> bool:
+    source = (text or "").strip()
+    return bool(
+        _REFERENCE_HEADING_RE.match(source) or _REFERENCE_ENTRY_RE.match(source)
+    )
+
+
+def audit_translation_completion(
+    working_dir: Path,
+    local_quality: dict[str, Any] | None,
+    target_language: str,
+) -> TranslationAudit:
+    attempted_count = 0
+    accepted_count = 0
+    empty_replacement_count = 0
+    protected_token_mismatch_count = 0
+    reference_excluded_count = 0
+    unresolved: list[dict[str, Any]] = []
+
+    for tracking_path in sorted(working_dir.rglob("translate_tracking.json")):
+        with tracking_path.open("r", encoding="utf-8") as handle:
+            tracking = json.load(handle)
+        for section in ("page", "cross_page", "cross_column"):
+            for page_index, page in enumerate(tracking.get(section, [])):
+                for paragraph_index, paragraph in enumerate(
+                    page.get("paragraph", [])
+                ):
+                    source = paragraph.get("input") or ""
+                    if not source.strip():
+                        continue
+                    if _is_reference_like(source):
+                        reference_excluded_count += 1
+                        continue
+                    attempted_count += 1
+                    target = paragraph.get("output")
+                    if target is None or not str(target).strip():
+                        empty_replacement_count += 1
+                        unresolved.append(
+                            {
+                                "section": section,
+                                "page_index": page_index,
+                                "paragraph_index": paragraph_index,
+                                "source_preview": source[:240],
+                                "reasons": ["empty_target"],
+                            }
+                        )
+                        continue
+                    validation = validate_translation(
+                        source,
+                        str(target),
+                        target_language,
+                    )
+                    if validation.accepted:
+                        accepted_count += 1
+                        continue
+                    if "protected_token_mismatch" in validation.reasons:
+                        protected_token_mismatch_count += 1
+                    unresolved.append(
+                        {
+                            "section": section,
+                            "page_index": page_index,
+                            "paragraph_index": paragraph_index,
+                            "source_preview": source[:240],
+                            "reasons": list(validation.reasons),
+                        }
+                    )
+
+    local_quality = local_quality or {}
+    local_unresolved = int(local_quality.get("unresolved_count") or 0)
+    unresolved_count = max(len(unresolved), local_unresolved)
+    if local_unresolved > len(unresolved):
+        unresolved.extend(local_quality.get("unresolved", []))
+
+    return TranslationAudit(
+        attempted_count=attempted_count,
+        accepted_count=accepted_count,
+        recovered_count=int(local_quality.get("recovered_count") or 0),
+        unresolved_count=unresolved_count,
+        empty_replacement_count=empty_replacement_count,
+        protected_token_mismatch_count=protected_token_mismatch_count,
+        reference_excluded_count=reference_excluded_count,
+        unresolved=tuple(unresolved),
+    )
+
+
+def ensure_translation_complete(
+    audit: TranslationAudit,
+    fail_on_unresolved: bool,
+) -> None:
+    if audit.empty_replacement_count:
+        raise TranslationCompletenessError(
+            f"translation completeness check found "
+            f"{audit.empty_replacement_count} empty paragraph replacements"
+        )
+    if fail_on_unresolved and audit.unresolved_count:
+        raise TranslationCompletenessError(
+            f"translation completeness check found "
+            f"{audit.unresolved_count} unresolved translatable paragraphs"
+        )
 
 PROXY_ENV_NAMES = (
     "ALL_PROXY",
@@ -559,8 +689,20 @@ class AppState:
             ),
             metadata_extra_data=f"local_zotero_{pdf_id}",
         )
+        config.translation_retry_chunk_sizes = list(
+            babeldoc_cfg.get("translation_retry_chunk_sizes", [700, 350])
+        )
 
         result = asyncio.run(self._consume_translate_events(pdf_id, async_translate, config))
+        audit = audit_translation_completion(
+            job_working_dir,
+            getattr(config, "local_translation_quality", None),
+            lang_out,
+        )
+        ensure_translation_complete(
+            audit,
+            bool(babeldoc_cfg.get("fail_on_unresolved_translation", True)),
+        )
         mono_path = result.no_watermark_mono_pdf_path or result.mono_pdf_path
         dual_path = result.no_watermark_dual_pdf_path or result.dual_pdf_path
         if not mono_path:
@@ -573,7 +715,11 @@ class AppState:
             status="success",
             stage="completed",
             progress=100.0,
-            message="",
+            message=(
+                "Translation audit passed: "
+                f"attempted={audit.attempted_count}, "
+                f"recovered={audit.recovered_count}, unresolved=0"
+            ),
             translation_pdf_path=str(mono_path),
             dual_pdf_path=str(dual_path),
             total_seconds=float(getattr(result, "total_seconds", 0.0) or 0.0),
