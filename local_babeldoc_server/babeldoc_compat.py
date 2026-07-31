@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import threading
 from dataclasses import dataclass, field
 from importlib import import_module
@@ -22,6 +23,7 @@ SUPPORTED_BABELDOC_VERSION = "0.6.4"
 PATCH_MARKER = "__local_immersive_translate_compat__"
 TABLE_OCR_LABEL = "babeldoc_table_ocr"
 OCR_BACKGROUND_MARKER_LINE_WIDTH = -1.0
+_STYLE_MARKUP_RE = re.compile(r"</?style\b[^>]*>", re.IGNORECASE)
 
 
 @dataclass(slots=True)
@@ -419,6 +421,7 @@ def install_babeldoc_compat(
             chunks = split_translation_chunks(source_text, int(chunk_size))
             translated_chunks = []
             chunk_failed = False
+            use_plain_style = False
             for chunk in chunks:
                 prompt = self.generate_prompt_for_llm(
                     chunk,
@@ -433,6 +436,7 @@ def install_babeldoc_compat(
                     _call_tracker(llm_tracker, "set_input", prompt)
                 translated_chunk = self.translate_engine.llm_translate(
                     prompt,
+                    ignore_cache=True,
                     rate_limit_params={"paragraph_token_count": len(chunk)},
                 )
                 translated_chunk = translated_chunk or ""
@@ -444,22 +448,72 @@ def install_babeldoc_compat(
                     getattr(self.translation_config, "lang_out", "zh"),
                 )
                 if not validation.accepted:
-                    last_reasons = validation.reasons
+                    translated_chunk = self.translate_engine.translate(
+                        chunk,
+                        ignore_cache=True,
+                        rate_limit_params={"paragraph_token_count": len(chunk)},
+                    )
+                    translated_chunk = translated_chunk or ""
                     if llm_tracker is not None:
-                        _call_tracker(
-                            llm_tracker,
-                            "set_error_message",
-                            ", ".join(validation.reasons),
+                        _call_tracker(llm_tracker, "set_output", translated_chunk)
+                    validation = validate_translation(
+                        chunk,
+                        translated_chunk,
+                        getattr(self.translation_config, "lang_out", "zh"),
+                    )
+                    if (
+                        not validation.accepted
+                        and validation.reasons == ("protected_token_mismatch",)
+                        and _STYLE_MARKUP_RE.search(chunk)
+                    ):
+                        plain_validation = validate_translation(
+                            _STYLE_MARKUP_RE.sub("", chunk),
+                            _STYLE_MARKUP_RE.sub("", translated_chunk),
+                            getattr(self.translation_config, "lang_out", "zh"),
                         )
-                    chunk_failed = True
-                    break
+                        if plain_validation.accepted:
+                            validation = plain_validation
+                            use_plain_style = True
+                    if not validation.accepted:
+                        last_reasons = validation.reasons
+                        if llm_tracker is not None:
+                            _call_tracker(
+                                llm_tracker,
+                                "set_error_message",
+                                ", ".join(validation.reasons),
+                            )
+                        chunk_failed = True
+                        break
                 translated_chunks.append(translated_chunk.strip())
             if chunk_failed or not translated_chunks:
                 continue
 
             combined = " ".join(translated_chunks)
+            combined_source = source_text
+            combined_translate_input = translate_input
+            if use_plain_style:
+                combined = _STYLE_MARKUP_RE.sub("", combined)
+                combined_source = _STYLE_MARKUP_RE.sub("", source_text)
+                formula_placeholders = [
+                    placeholder
+                    for placeholder in getattr(translate_input, "placeholders", [])
+                    if hasattr(placeholder, "placeholder")
+                    and not hasattr(placeholder, "left_placeholder")
+                ]
+                combined_translate_input = self.TranslateInput(
+                    combined_source,
+                    formula_placeholders,
+                    getattr(translate_input, "base_style", None),
+                )
+                setter = getattr(
+                    combined_translate_input,
+                    "set_original_placeholder_tokens",
+                    None,
+                )
+                if callable(setter):
+                    setter({})
             combined_validation = validate_translation(
-                source_text,
+                combined_source,
                 combined,
                 getattr(self.translation_config, "lang_out", "zh"),
             )
@@ -472,7 +526,7 @@ def install_babeldoc_compat(
                 self,
                 paragraph,
                 tracker,
-                translate_input,
+                combined_translate_input,
                 combined,
             )
             _record_quality_event(

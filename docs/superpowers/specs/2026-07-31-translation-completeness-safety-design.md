@@ -43,7 +43,9 @@ A target is rejected when any of these conditions apply:
 1. The source is non-empty but the target is empty or whitespace-only.
 2. The target is truncated or falls outside conservative length bounds.
 3. Formula/style placeholders required by the source are missing, duplicated, or
-   unexpectedly introduced.
+   unexpectedly introduced. As a final content-first fallback, malformed
+   rich-text-only style markers may be removed and the paragraph rendered with
+   its base style after formula and protected-content validation still passes.
 4. Protected tokens such as URLs, DOI values, citation ranges, and meaningful
    numeric values are lost.
 5. A substantial English source is returned materially unchanged when Chinese is

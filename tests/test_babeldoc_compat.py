@@ -215,13 +215,22 @@ class FakeTranslateEngine:
 
 
 class FakeQueuedLLMEngine:
-    def __init__(self, outputs):
+    def __init__(self, outputs, require_cache_bypass=False, simple_outputs=None):
         self.outputs = list(outputs)
         self.inputs = []
+        self.require_cache_bypass = require_cache_bypass
+        self.simple_outputs = list(simple_outputs or [])
+        self.simple_inputs = []
 
-    def llm_translate(self, text, rate_limit_params=None):
+    def llm_translate(self, text, ignore_cache=False, rate_limit_params=None):
         self.inputs.append(text)
+        if self.require_cache_bypass and not ignore_cache:
+            return ""
         return self.outputs.pop(0) if self.outputs else ""
+
+    def translate(self, text, ignore_cache=False, rate_limit_params=None):
+        self.simple_inputs.append(text)
+        return self.simple_outputs.pop(0) if self.simple_outputs else ""
 
 
 class FakeOcrRuntime:
@@ -333,6 +342,87 @@ class BabeldocCompatTest(unittest.TestCase):
         self.assertEqual(quality["recovered_count"], 0)
         self.assertEqual(quality["unresolved_count"], 1)
         self.assertIn("empty_target", quality["unresolved"][0]["reasons"])
+
+    def test_recovery_bypasses_cached_empty_model_response(self):
+        modules = fake_modules()
+        source = paragraph("Mobile robots combine sensor measurements safely.")
+        tracker = FakeTracker()
+        translator = FakeILTranslator()
+        translator.initial_output = ""
+        translator.translation_config.translation_retry_chunk_sizes = [700]
+        translator.translate_engine = FakeQueuedLLMEngine(
+            ["移动机器人安全地融合传感器测量结果。"],
+            require_cache_bypass=True,
+        )
+
+        with patch.dict(sys.modules, modules):
+            handle = install_babeldoc_compat(
+                {"preserve_references": True, "preserve_toc_layout": True}
+            )
+            translator.translate_paragraph(source, tracker=tracker)
+            handle.restore()
+
+        self.assertEqual(source.unicode, "移动机器人安全地融合传感器测量结果。")
+        self.assertEqual(
+            translator.translation_config.local_translation_quality[
+                "recovered_count"
+            ],
+            1,
+        )
+
+    def test_recovery_uses_simple_translation_when_llm_prompt_returns_empty(self):
+        modules = fake_modules()
+        source = paragraph("Mobile robots estimate position from sensor data.")
+        tracker = FakeTracker()
+        translator = FakeILTranslator()
+        translator.initial_output = ""
+        translator.translation_config.translation_retry_chunk_sizes = [700]
+        translator.translate_engine = FakeQueuedLLMEngine(
+            [""],
+            simple_outputs=["移动机器人根据传感器数据估计位置。"],
+        )
+
+        with patch.dict(sys.modules, modules):
+            handle = install_babeldoc_compat(
+                {"preserve_references": True, "preserve_toc_layout": True}
+            )
+            translator.translate_paragraph(source, tracker=tracker)
+            handle.restore()
+
+        self.assertEqual(source.unicode, "移动机器人根据传感器数据估计位置。")
+        self.assertEqual(
+            translator.translate_engine.simple_inputs,
+            ["Mobile robots estimate position from sensor data."],
+        )
+
+    def test_recovery_can_drop_broken_rich_text_style_without_losing_content(self):
+        modules = fake_modules()
+        source = paragraph(
+            "This method<style id='1'>e</style>stimates the robot position."
+        )
+        tracker = FakeTracker()
+        translator = FakeILTranslator()
+        translator.initial_output = ""
+        translator.translation_config.translation_retry_chunk_sizes = [700]
+        translator.translate_engine = FakeQueuedLLMEngine(
+            [""],
+            simple_outputs=["该方法估计机器人的位置。"],
+        )
+
+        with patch.dict(sys.modules, modules):
+            handle = install_babeldoc_compat(
+                {"preserve_references": True, "preserve_toc_layout": True}
+            )
+            translator.translate_paragraph(source, tracker=tracker)
+            handle.restore()
+
+        self.assertEqual(source.unicode, "该方法估计机器人的位置。")
+        self.assertEqual(
+            translator.translation_config.local_translation_quality[
+                "recovered_count"
+            ],
+            1,
+        )
 
     def test_installs_once_marks_structure_and_restores_original_methods(self):
         modules = fake_modules()

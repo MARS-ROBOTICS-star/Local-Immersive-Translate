@@ -64,6 +64,33 @@ class TranslationValidationTest(unittest.TestCase):
         self.assertTrue(result.accepted, result.reasons)
         self.assertEqual(result.reasons, ())
 
+    def test_allows_alphanumeric_dimension_term_to_be_translated_semantically(self) -> None:
+        source = "The two cameras derive a 3D representation of the detected scene."
+        target = "两个相机可获得检测场景的三维表示。"
+
+        result = validate_translation(source, target, "zh")
+
+        self.assertTrue(result.accepted, result.reasons)
+
+    def test_allows_contextual_month_name_to_add_numeric_month(self) -> None:
+        source = (
+            "ry 18, 2020, accepted February 10, 2020, "
+            "date of publication February 24, 2020."
+        )
+        target = "2020年1月18日，2020年2月10日接受，2020年2月24日出版。"
+
+        result = validate_translation(source, target, "zh")
+
+        self.assertTrue(result.accepted, result.reasons)
+
+    def test_allows_lexical_number_compound_to_use_chinese_number_word(self) -> None:
+        source = "The algorithm employs a 2-stage data reduction process."
+        target = "该算法采用两阶段数据缩减过程。"
+
+        result = validate_translation(source, target, "zh")
+
+        self.assertTrue(result.accepted, result.reasons)
+
 
 class TranslationChunkingTest(unittest.TestCase):
     def test_splits_at_sentence_boundaries_without_losing_or_reordering_text(self) -> None:

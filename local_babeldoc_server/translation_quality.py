@@ -11,7 +11,9 @@ _STYLE_TAG_RE = re.compile(r"</?style\b[^>]*>", re.IGNORECASE)
 _URL_RE = re.compile(r"https?://[^\s<>\"'，。]+", re.IGNORECASE)
 _DOI_RE = re.compile(r"10\.\d{4,9}/[-._;()/:A-Z0-9]+", re.IGNORECASE)
 _CITATION_RE = re.compile(r"\[\s*\d+(?:\s*[-–—]\s*\d+)?\s*]")
-_NUMBER_RE = re.compile(r"(?<![A-Za-z])\d+(?:\.\d+)?%?")
+_NUMBER_RE = re.compile(
+    r"(?<![A-Za-z])\d+(?:\.\d+)?%?(?![A-Za-z]|[-‐‑–—][A-Za-z])"
+)
 _SENTENCE_BREAK_RE = re.compile(r"(?<=[.!?。！？])\s+")
 _TERMINAL_PUNCTUATION_RE = re.compile(r"[.!?。！？][\"'’”）)】\]]*$")
 
@@ -30,10 +32,17 @@ def _protected_tokens(text: str) -> Counter[str]:
         _URL_RE,
         _DOI_RE,
         _CITATION_RE,
-        _NUMBER_RE,
     ):
         tokens.extend(match.group(0) for match in pattern.finditer(text))
     return Counter(tokens)
+
+
+def _has_protected_token_loss(source: str, target: str) -> bool:
+    if _protected_tokens(source) != _protected_tokens(target):
+        return True
+    source_numbers = Counter(match.group(0) for match in _NUMBER_RE.finditer(source))
+    target_numbers = Counter(match.group(0) for match in _NUMBER_RE.finditer(target))
+    return bool(source_numbers - target_numbers)
 
 
 def _without_trailing_style_tags(text: str) -> str:
@@ -59,7 +68,7 @@ def validate_translation(
     if not target_text:
         return ValidationResult(False, ("empty_target",))
 
-    if _protected_tokens(source_text) != _protected_tokens(target_text):
+    if _has_protected_token_loss(source_text, target_text):
         reasons.append("protected_token_mismatch")
 
     normalized_source = " ".join(source_text.split())
