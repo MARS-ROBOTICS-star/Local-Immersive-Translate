@@ -124,6 +124,9 @@ class FakeStylesAndFormulas:
 
     def process(self, document):
         document.original_styles_process_called = True
+        document.paragraphs_seen_by_styles = [
+            list(page.pdf_paragraph) for page in document.page
+        ]
         return document
 
 
@@ -478,6 +481,46 @@ class BabeldocCompatTest(unittest.TestCase):
 
         self.assertEqual(result, (None, None))
         self.assertEqual(tracker.pdf_unicode, reference.unicode)
+
+    def test_ocr_reference_paragraph_bypasses_formula_style_processing(self):
+        modules = fake_modules()
+        reference = paragraph(
+            "[30] A. C. Murtra, Efficient use of 3D environment models, "
+            "vol. 6472, 2010, pp. 461–472.",
+            REFERENCE_LABEL,
+        )
+        body = paragraph("Mobile robots navigate autonomously.", "plain text")
+        reference_background = SimpleNamespace(
+            box=SimpleNamespace(x=35.0, y=95.0, x2=525.0, y2=117.0),
+            fill_background=True,
+        )
+        body_background = SimpleNamespace(
+            box=SimpleNamespace(x=35.0, y=195.0, x2=525.0, y2=217.0),
+            fill_background=True,
+        )
+        page = SimpleNamespace(
+            pdf_paragraph=[reference, body],
+            pdf_rectangle=[reference_background, body_background],
+        )
+        document = SimpleNamespace(page=[page])
+
+        with patch.dict(sys.modules, modules):
+            handle = install_babeldoc_compat(
+                {
+                    "preserve_references": True,
+                    "preserve_toc_layout": True,
+                    "enable_table_ocr": True,
+                },
+                FakeOcrRuntime([]),
+            )
+            styles = FakeStylesAndFormulas()
+            styles.translation_config = SimpleNamespace(ocr_workaround=True)
+            styles.process(document)
+            handle.restore()
+
+        self.assertEqual(document.paragraphs_seen_by_styles, [[body]])
+        self.assertEqual(page.pdf_paragraph, [reference, body])
+        self.assertEqual(page.pdf_rectangle, [body_background])
 
     def test_ocr_paragraph_is_prepared_for_translation(self):
         modules = fake_modules()

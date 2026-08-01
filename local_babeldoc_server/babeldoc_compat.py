@@ -127,6 +127,47 @@ def _rgb_graphic_state(il_version: Any, rgb: tuple[int, int, int]):
     )
 
 
+def _box_overlap_ratio(inner: Any, outer: Any) -> float:
+    if inner is None or outer is None:
+        return 0.0
+    width = max(0.0, float(inner.x2) - float(inner.x))
+    height = max(0.0, float(inner.y2) - float(inner.y))
+    area = width * height
+    if area == 0:
+        return 0.0
+    intersection_width = max(
+        0.0,
+        min(float(inner.x2), float(outer.x2))
+        - max(float(inner.x), float(outer.x)),
+    )
+    intersection_height = max(
+        0.0,
+        min(float(inner.y2), float(outer.y2))
+        - max(float(inner.y), float(outer.y)),
+    )
+    return intersection_width * intersection_height / area
+
+
+def _remove_reference_backgrounds(page: Any, references: list[Any]) -> None:
+    reference_boxes = [
+        getattr(paragraph, "box", None)
+        for paragraph in references
+        if getattr(paragraph, "box", None) is not None
+    ]
+    page.pdf_rectangle = [
+        rectangle
+        for rectangle in getattr(page, "pdf_rectangle", [])
+        if not (
+            getattr(rectangle, "fill_background", False)
+            and any(
+                _box_overlap_ratio(reference_box, getattr(rectangle, "box", None))
+                >= 0.5
+                for reference_box in reference_boxes
+            )
+        )
+    ]
+
+
 def _make_ocr_paragraph(il_version: Any, block: Any, debug_id: str):
     text_state = il_version.GraphicState(
         passthrough_per_char_instruction="0 g 0 G"
@@ -626,7 +667,41 @@ def install_babeldoc_compat(
             return units
 
         def wrapped_styles_process(self, document):
-            result = original_styles_process(self, document)
+            preserved_page_paragraphs = []
+            bypass_reference_styles = bool(
+                preserve_references
+                and getattr(self.translation_config, "ocr_workaround", False)
+            )
+            if bypass_reference_styles:
+                for page in getattr(document, "page", []):
+                    original_paragraphs = list(
+                        getattr(page, "pdf_paragraph", [])
+                    )
+                    references = [
+                        paragraph
+                        for paragraph in original_paragraphs
+                        if getattr(paragraph, "layout_label", None)
+                        == REFERENCE_LABEL
+                    ]
+                    preserved_page_paragraphs.append(
+                        (page, original_paragraphs, references)
+                    )
+                    page.pdf_paragraph = [
+                        paragraph
+                        for paragraph in original_paragraphs
+                        if getattr(paragraph, "layout_label", None)
+                        != REFERENCE_LABEL
+                    ]
+            try:
+                result = original_styles_process(self, document)
+            finally:
+                for (
+                    page,
+                    original_paragraphs,
+                    references,
+                ) in preserved_page_paragraphs:
+                    page.pdf_paragraph = original_paragraphs
+                    _remove_reference_backgrounds(page, references)
             context = getattr(
                 self.translation_config,
                 "local_table_ocr_context",
