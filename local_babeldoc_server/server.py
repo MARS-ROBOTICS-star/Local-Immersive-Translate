@@ -124,6 +124,122 @@ class TranslationCompletenessError(RuntimeError):
 
 
 @dataclass(frozen=True)
+class WatchedProcess:
+    pid: int
+    create_time: float
+
+
+def _is_zotero_process(process: Any) -> bool:
+    try:
+        name = str(process.name() or "").casefold().removesuffix(".exe")
+        command = list(process.cmdline() or [])
+    except Exception:
+        return False
+    executable = ""
+    if command:
+        executable = Path(str(command[0])).name.casefold().removesuffix(".exe")
+    return name in {"zotero", "zotero-bin"} or executable in {
+        "zotero",
+        "zotero-bin",
+    }
+
+
+def find_zotero_ancestor(process: Any = None) -> WatchedProcess | None:
+    if process is None:
+        try:
+            import psutil
+
+            process = psutil.Process()
+        except Exception:
+            logger.warning(
+                "Unable to inspect the backend parent process; "
+                "Zotero lifecycle watchdog is disabled",
+                exc_info=True,
+            )
+            return None
+    try:
+        parents = process.parents()
+    except Exception:
+        logger.warning(
+            "Unable to inspect backend ancestors; "
+            "Zotero lifecycle watchdog is disabled",
+            exc_info=True,
+        )
+        return None
+    for parent in parents:
+        if not _is_zotero_process(parent):
+            continue
+        try:
+            return WatchedProcess(
+                pid=int(parent.pid),
+                create_time=float(parent.create_time()),
+            )
+        except Exception:
+            logger.warning(
+                "Unable to record Zotero process identity; "
+                "lifecycle watchdog is disabled",
+                exc_info=True,
+            )
+            return None
+    return None
+
+
+def is_watched_process_alive(
+    watched: WatchedProcess,
+    process_factory: Any = None,
+) -> bool:
+    if process_factory is None:
+        try:
+            import psutil
+
+            process_factory = psutil.Process
+        except Exception:
+            return True
+    try:
+        process = process_factory(watched.pid)
+        return abs(float(process.create_time()) - watched.create_time) < 0.001
+    except Exception as exc:
+        try:
+            import psutil
+
+            if isinstance(exc, psutil.AccessDenied):
+                return True
+        except Exception:
+            pass
+        return False
+
+
+def start_zotero_parent_watchdog(
+    server: Any,
+    *,
+    current_process: Any = None,
+    process_factory: Any = None,
+    poll_interval: float = 2.0,
+) -> threading.Thread | None:
+    watched = find_zotero_ancestor(current_process)
+    if watched is None:
+        return None
+
+    def watch_owner() -> None:
+        while is_watched_process_alive(watched, process_factory):
+            time.sleep(poll_interval)
+        logger.info(
+            "Owning Zotero process %s exited; stopping local BabelDOC server",
+            watched.pid,
+        )
+        server.shutdown()
+
+    thread = threading.Thread(
+        target=watch_owner,
+        name="zotero-parent-watchdog",
+        daemon=True,
+    )
+    thread.start()
+    logger.info("Watching owning Zotero process: pid=%s", watched.pid)
+    return thread
+
+
+@dataclass(frozen=True)
 class TranslationAudit:
     attempted_count: int = 0
     accepted_count: int = 0
@@ -1125,6 +1241,7 @@ def main() -> None:
     host = config["server"]["host"]
     port = int(config["server"]["port"])
     server = LocalBabelDOCServer((host, port), state)
+    start_zotero_parent_watchdog(server)
     logger.info("Local BabelDOC server listening on http://%s:%s/zotero", host, port)
     logger.info("BabelDOC repo: %s", state.babeldoc_repo)
     logger.info("Data dir: %s", state.data_dir)

@@ -1,6 +1,7 @@
 import asyncio
 import sys
 import tempfile
+import threading
 import types
 import unittest
 from pathlib import Path
@@ -12,9 +13,150 @@ from local_babeldoc_server.server import TranslationCompletenessError
 from local_babeldoc_server.server import audit_translation_completion
 from local_babeldoc_server.server import ensure_translation_complete
 from local_babeldoc_server.server import load_config
+from local_babeldoc_server.server import find_zotero_ancestor
+from local_babeldoc_server.server import is_watched_process_alive
+from local_babeldoc_server.server import start_zotero_parent_watchdog
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
+class FakeProcess:
+    def __init__(
+        self,
+        pid: int,
+        *,
+        name: str,
+        cmdline: tuple[str, ...],
+        create_time: float,
+        parents: tuple["FakeProcess", ...] = (),
+    ) -> None:
+        self.pid = pid
+        self._name = name
+        self._cmdline = cmdline
+        self._create_time = create_time
+        self._parents = parents
+
+    def name(self) -> str:
+        return self._name
+
+    def cmdline(self) -> list[str]:
+        return list(self._cmdline)
+
+    def create_time(self) -> float:
+        return self._create_time
+
+    def parents(self) -> list["FakeProcess"]:
+        return list(self._parents)
+
+
+class EventServer:
+    def __init__(self) -> None:
+        self.shutdown_called = threading.Event()
+
+    def shutdown(self) -> None:
+        self.shutdown_called.set()
+
+
+class ZoteroParentWatchdogTest(unittest.TestCase):
+    def test_finds_zotero_ancestor_by_process_identity(self) -> None:
+        zotero = FakeProcess(
+            122529,
+            name="zotero-bin",
+            cmdline=("/usr/lib/zotero/zotero-bin", "-app"),
+            create_time=1785585656.25,
+        )
+        uv = FakeProcess(
+            17667,
+            name="uv",
+            cmdline=("uv", "run", "python"),
+            create_time=1785502605.5,
+        )
+        server = FakeProcess(
+            17671,
+            name="python3",
+            cmdline=("python3", "server.py"),
+            create_time=1785502606.0,
+            parents=(uv, zotero),
+        )
+
+        watched = find_zotero_ancestor(server)
+
+        self.assertEqual(watched.pid, 122529)
+        self.assertEqual(watched.create_time, 1785585656.25)
+
+    def test_manual_backend_without_zotero_ancestor_is_not_managed(self) -> None:
+        shell = FakeProcess(
+            500,
+            name="bash",
+            cmdline=("bash",),
+            create_time=100.0,
+        )
+        server_process = FakeProcess(
+            501,
+            name="python3",
+            cmdline=("python3", "server.py"),
+            create_time=101.0,
+            parents=(shell,),
+        )
+        server = EventServer()
+
+        thread = start_zotero_parent_watchdog(
+            server,
+            current_process=server_process,
+            poll_interval=0.001,
+        )
+
+        self.assertIsNone(thread)
+        self.assertFalse(server.shutdown_called.is_set())
+
+    def test_pid_reuse_does_not_count_as_the_same_owner(self) -> None:
+        watched = SimpleNamespace(pid=42, create_time=100.0)
+        replacement = FakeProcess(
+            42,
+            name="zotero-bin",
+            cmdline=("/usr/lib/zotero/zotero-bin",),
+            create_time=200.0,
+        )
+
+        alive = is_watched_process_alive(
+            watched,
+            process_factory=lambda _pid: replacement,
+        )
+
+        self.assertFalse(alive)
+
+    def test_watchdog_shuts_down_server_when_zotero_owner_disappears(self) -> None:
+        zotero = FakeProcess(
+            42,
+            name="zotero-bin",
+            cmdline=("/usr/lib/zotero/zotero-bin",),
+            create_time=100.0,
+        )
+        server_process = FakeProcess(
+            43,
+            name="python3",
+            cmdline=("python3", "server.py"),
+            create_time=101.0,
+            parents=(zotero,),
+        )
+        reused_pid = FakeProcess(
+            42,
+            name="unrelated-process",
+            cmdline=("unrelated-process",),
+            create_time=200.0,
+        )
+        server = EventServer()
+
+        thread = start_zotero_parent_watchdog(
+            server,
+            current_process=server_process,
+            process_factory=lambda _pid: reused_pid,
+            poll_interval=0.001,
+        )
+
+        self.assertIsNotNone(thread)
+        self.assertTrue(server.shutdown_called.wait(0.2))
 
 
 def make_config(data_dir: Path) -> dict:
