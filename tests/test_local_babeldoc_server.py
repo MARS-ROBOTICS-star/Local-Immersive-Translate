@@ -1,4 +1,5 @@
 import asyncio
+import subprocess
 import sys
 import tempfile
 import threading
@@ -157,6 +158,22 @@ class ZoteroParentWatchdogTest(unittest.TestCase):
 
         self.assertIsNotNone(thread)
         self.assertTrue(server.shutdown_called.wait(0.2))
+
+
+class ServerEntrypointTest(unittest.TestCase):
+    def test_direct_script_start_works_outside_project_directory(self) -> None:
+        server_script = PROJECT_ROOT / "local_babeldoc_server" / "server.py"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            result = subprocess.run(
+                [sys.executable, str(server_script), "--help"],
+                cwd=temp_dir,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Local BabelDOC server for Zotero", result.stdout)
 
 
 def make_config(data_dir: Path) -> dict:

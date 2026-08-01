@@ -27,9 +27,12 @@ from urllib.parse import unquote
 from urllib.parse import urlencode
 from urllib.parse import urlparse
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if __package__ in (None, "") and str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
 from local_babeldoc_server.translation_quality import validate_translation
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DATA_DIR = REPO_ROOT / ".local-babeldoc"
 DEFAULT_BABELDOC_REPO = REPO_ROOT / "BabelDOC"
 
