@@ -7,6 +7,7 @@ import json
 import logging
 import mimetypes
 import os
+import re
 import shutil
 import sys
 import threading
@@ -27,6 +28,11 @@ from urllib.parse import urlencode
 from urllib.parse import urlparse
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+if __package__ in (None, "") and str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from local_babeldoc_server.translation_quality import validate_translation
+
 DEFAULT_DATA_DIR = REPO_ROOT / ".local-babeldoc"
 DEFAULT_BABELDOC_REPO = REPO_ROOT / "BabelDOC"
 
@@ -102,11 +108,258 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "skip_form_render": False,
         "skip_curve_render": False,
         "remove_non_formula_lines": False,
+        "enable_native_table_translation": True,
+        "enable_table_ocr": True,
+        "preserve_references": True,
+        "preserve_toc_layout": True,
+        "enable_translation_quality_guard": True,
+        "translation_retry_chunk_sizes": [700, 350],
+        "fail_on_unresolved_translation": True,
     },
     "models": MODEL_DEFAULTS,
 }
 
 logger = logging.getLogger("local_babeldoc_server")
+
+
+class TranslationCompletenessError(RuntimeError):
+    pass
+
+
+@dataclass(frozen=True)
+class WatchedProcess:
+    pid: int
+    create_time: float
+
+
+def _is_zotero_process(process: Any) -> bool:
+    try:
+        name = str(process.name() or "").casefold().removesuffix(".exe")
+        command = list(process.cmdline() or [])
+    except Exception:
+        return False
+    executable = ""
+    if command:
+        executable = Path(str(command[0])).name.casefold().removesuffix(".exe")
+    return name in {"zotero", "zotero-bin"} or executable in {
+        "zotero",
+        "zotero-bin",
+    }
+
+
+def find_zotero_ancestor(process: Any = None) -> WatchedProcess | None:
+    if process is None:
+        try:
+            import psutil
+
+            process = psutil.Process()
+        except Exception:
+            logger.warning(
+                "Unable to inspect the backend parent process; "
+                "Zotero lifecycle watchdog is disabled",
+                exc_info=True,
+            )
+            return None
+    try:
+        parents = process.parents()
+    except Exception:
+        logger.warning(
+            "Unable to inspect backend ancestors; "
+            "Zotero lifecycle watchdog is disabled",
+            exc_info=True,
+        )
+        return None
+    for parent in parents:
+        if not _is_zotero_process(parent):
+            continue
+        try:
+            return WatchedProcess(
+                pid=int(parent.pid),
+                create_time=float(parent.create_time()),
+            )
+        except Exception:
+            logger.warning(
+                "Unable to record Zotero process identity; "
+                "lifecycle watchdog is disabled",
+                exc_info=True,
+            )
+            return None
+    return None
+
+
+def is_watched_process_alive(
+    watched: WatchedProcess,
+    process_factory: Any = None,
+) -> bool:
+    if process_factory is None:
+        try:
+            import psutil
+
+            process_factory = psutil.Process
+        except Exception:
+            return True
+    try:
+        process = process_factory(watched.pid)
+        return abs(float(process.create_time()) - watched.create_time) < 0.001
+    except Exception as exc:
+        try:
+            import psutil
+
+            if isinstance(exc, psutil.AccessDenied):
+                return True
+        except Exception:
+            pass
+        return False
+
+
+def start_zotero_parent_watchdog(
+    server: Any,
+    *,
+    current_process: Any = None,
+    process_factory: Any = None,
+    poll_interval: float = 2.0,
+) -> threading.Thread | None:
+    watched = find_zotero_ancestor(current_process)
+    if watched is None:
+        return None
+
+    def watch_owner() -> None:
+        while is_watched_process_alive(watched, process_factory):
+            time.sleep(poll_interval)
+        logger.info(
+            "Owning Zotero process %s exited; stopping local BabelDOC server",
+            watched.pid,
+        )
+        server.shutdown()
+
+    thread = threading.Thread(
+        target=watch_owner,
+        name="zotero-parent-watchdog",
+        daemon=True,
+    )
+    thread.start()
+    logger.info("Watching owning Zotero process: pid=%s", watched.pid)
+    return thread
+
+
+@dataclass(frozen=True)
+class TranslationAudit:
+    attempted_count: int = 0
+    accepted_count: int = 0
+    recovered_count: int = 0
+    unresolved_count: int = 0
+    empty_replacement_count: int = 0
+    protected_token_mismatch_count: int = 0
+    reference_excluded_count: int = 0
+    unresolved: tuple[dict[str, Any], ...] = ()
+
+
+_REFERENCE_HEADING_RE = re.compile(
+    r"^\s*(references|bibliography|works\s+cited|literature\s+cited)\s*$",
+    re.IGNORECASE,
+)
+_REFERENCE_ENTRY_RE = re.compile(r"^\s*\[\s*\d+\s*]\s+\S+")
+
+
+def _is_reference_like(text: str) -> bool:
+    source = (text or "").strip()
+    return bool(
+        _REFERENCE_HEADING_RE.match(source) or _REFERENCE_ENTRY_RE.match(source)
+    )
+
+
+def audit_translation_completion(
+    working_dir: Path,
+    local_quality: dict[str, Any] | None,
+    target_language: str,
+) -> TranslationAudit:
+    attempted_count = 0
+    accepted_count = 0
+    empty_replacement_count = 0
+    protected_token_mismatch_count = 0
+    reference_excluded_count = 0
+    unresolved: list[dict[str, Any]] = []
+
+    for tracking_path in sorted(working_dir.rglob("translate_tracking.json")):
+        with tracking_path.open("r", encoding="utf-8") as handle:
+            tracking = json.load(handle)
+        for section in ("page", "cross_page", "cross_column"):
+            for page_index, page in enumerate(tracking.get(section, [])):
+                for paragraph_index, paragraph in enumerate(
+                    page.get("paragraph", [])
+                ):
+                    source = paragraph.get("input") or ""
+                    if not source.strip():
+                        continue
+                    if _is_reference_like(source):
+                        reference_excluded_count += 1
+                        continue
+                    attempted_count += 1
+                    target = paragraph.get("output")
+                    if target is None or not str(target).strip():
+                        empty_replacement_count += 1
+                        unresolved.append(
+                            {
+                                "section": section,
+                                "page_index": page_index,
+                                "paragraph_index": paragraph_index,
+                                "source_preview": source[:240],
+                                "reasons": ["empty_target"],
+                            }
+                        )
+                        continue
+                    validation = validate_translation(
+                        source,
+                        str(target),
+                        target_language,
+                    )
+                    if validation.accepted:
+                        accepted_count += 1
+                        continue
+                    if "protected_token_mismatch" in validation.reasons:
+                        protected_token_mismatch_count += 1
+                    unresolved.append(
+                        {
+                            "section": section,
+                            "page_index": page_index,
+                            "paragraph_index": paragraph_index,
+                            "source_preview": source[:240],
+                            "reasons": list(validation.reasons),
+                        }
+                    )
+
+    local_quality = local_quality or {}
+    local_unresolved = int(local_quality.get("unresolved_count") or 0)
+    unresolved_count = max(len(unresolved), local_unresolved)
+    if local_unresolved > len(unresolved):
+        unresolved.extend(local_quality.get("unresolved", []))
+
+    return TranslationAudit(
+        attempted_count=attempted_count,
+        accepted_count=accepted_count,
+        recovered_count=int(local_quality.get("recovered_count") or 0),
+        unresolved_count=unresolved_count,
+        empty_replacement_count=empty_replacement_count,
+        protected_token_mismatch_count=protected_token_mismatch_count,
+        reference_excluded_count=reference_excluded_count,
+        unresolved=tuple(unresolved),
+    )
+
+
+def ensure_translation_complete(
+    audit: TranslationAudit,
+    fail_on_unresolved: bool,
+) -> None:
+    if audit.empty_replacement_count:
+        raise TranslationCompletenessError(
+            f"translation completeness check found "
+            f"{audit.empty_replacement_count} empty paragraph replacements"
+        )
+    if fail_on_unresolved and audit.unresolved_count:
+        raise TranslationCompletenessError(
+            f"translation completeness check found "
+            f"{audit.unresolved_count} unresolved translatable paragraphs"
+        )
 
 PROXY_ENV_NAMES = (
     "ALL_PROXY",
@@ -237,6 +490,10 @@ class AppState:
         self.jobs_lock = threading.RLock()
         self.doc_layout_model = None
         self.doc_layout_lock = threading.Lock()
+        self.babeldoc_compat_handle = None
+        self.babeldoc_compat_lock = threading.Lock()
+        self.table_ocr_runtime = None
+        self.table_ocr_lock = threading.Lock()
         self.babeldoc_repo = resolve_repo_relative_path(babeldoc_cfg["repo_path"])
         if self.babeldoc_repo.exists():
             sys.path.insert(0, str(self.babeldoc_repo))
@@ -363,6 +620,30 @@ class AppState:
             self.doc_layout_model = DocLayoutModel.load_onnx()
             return self.doc_layout_model
 
+    def _get_table_ocr_runtime(self):
+        if not self.config["babeldoc"].get("enable_table_ocr", True):
+            return None
+        with self.table_ocr_lock:
+            if self.table_ocr_runtime is None:
+                from local_babeldoc_server.table_ocr import TableOcrRuntime
+                from local_babeldoc_server.table_ocr import create_rapidocr_engine
+
+                self.table_ocr_runtime = TableOcrRuntime(create_rapidocr_engine)
+            return self.table_ocr_runtime
+
+    def _ensure_babeldoc_compat(self) -> None:
+        with self.babeldoc_compat_lock:
+            if self.babeldoc_compat_handle is not None:
+                return
+            from local_babeldoc_server.babeldoc_compat import (
+                install_babeldoc_compat,
+            )
+
+            self.babeldoc_compat_handle = install_babeldoc_compat(
+                self.config["babeldoc"],
+                self._get_table_ocr_runtime(),
+            )
+
     def _create_translator(
         self,
         model_key: str,
@@ -425,6 +706,7 @@ class AppState:
         )
 
     def _run_babeldoc(self, pdf_id: str) -> None:
+        self._ensure_babeldoc_compat()
         from babeldoc.format.pdf.high_level import async_translate
         from babeldoc.format.pdf.translation_config import TranslationConfig
         from babeldoc.format.pdf.translation_config import WatermarkOutputMode
@@ -526,8 +808,20 @@ class AppState:
             ),
             metadata_extra_data=f"local_zotero_{pdf_id}",
         )
+        config.translation_retry_chunk_sizes = list(
+            babeldoc_cfg.get("translation_retry_chunk_sizes", [700, 350])
+        )
 
         result = asyncio.run(self._consume_translate_events(pdf_id, async_translate, config))
+        audit = audit_translation_completion(
+            job_working_dir,
+            getattr(config, "local_translation_quality", None),
+            lang_out,
+        )
+        ensure_translation_complete(
+            audit,
+            bool(babeldoc_cfg.get("fail_on_unresolved_translation", True)),
+        )
         mono_path = result.no_watermark_mono_pdf_path or result.mono_pdf_path
         dual_path = result.no_watermark_dual_pdf_path or result.dual_pdf_path
         if not mono_path:
@@ -540,7 +834,11 @@ class AppState:
             status="success",
             stage="completed",
             progress=100.0,
-            message="",
+            message=(
+                "Translation audit passed: "
+                f"attempted={audit.attempted_count}, "
+                f"recovered={audit.recovered_count}, unresolved=0"
+            ),
             translation_pdf_path=str(mono_path),
             dual_pdf_path=str(dual_path),
             total_seconds=float(getattr(result, "total_seconds", 0.0) or 0.0),
@@ -946,6 +1244,7 @@ def main() -> None:
     host = config["server"]["host"]
     port = int(config["server"]["port"])
     server = LocalBabelDOCServer((host, port), state)
+    start_zotero_parent_watchdog(server)
     logger.info("Local BabelDOC server listening on http://%s:%s/zotero", host, port)
     logger.info("BabelDOC repo: %s", state.babeldoc_repo)
     logger.info("Data dir: %s", state.data_dir)

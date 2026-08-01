@@ -4,6 +4,12 @@ This folder contains the local backend used by the Zotero plugin. It exposes a Z
 
 Local Immersive Translate v0.0.25 uses and pins BabelDOC v0.6.4. Run the installer again, or click `Install / Repair Local Backend` in Zotero preferences, to update an existing checkout to the supported version.
 
+The backend also applies structure-aware PDF repairs by default: native table
+text remains translatable, table regions without enough extractable text use
+RapidOCR, `References` / `Bibliography` headings and entries remain in the
+source language, and table-of-contents entries translate only their titles
+while retaining numbering, dot leaders, indentation, and page numbers.
+
 ## What It Provides
 
 - `GET /zotero/check-key`
@@ -92,4 +98,9 @@ For DeepSeek-compatible APIs, the model JSON can also include `"thinking": "enab
 ## Notes
 
 - The local backend generates both translation-only and dual-language PDFs so the plugin's `dual`, `translation`, and `all` modes continue to work.
+- Table OCR is region-scoped and lazy at runtime. The installer installs and prewarms RapidOCR; rerun `Install / Repair Local Backend` if an existing installation reports that RapidOCR is missing.
+- Advanced JSON configuration can disable individual repairs with `enable_table_ocr`, `preserve_references`, or `preserve_toc_layout` under `babeldoc`.
+- Translation completeness protection is enabled by default. Empty, truncated, unchanged, or structurally lossy model output is rejected before it can replace a source paragraph. Rejected paragraphs are retried in sentence-aligned chunks configured by `translation_retry_chunk_sizes` (default `[700, 350]`).
+- If a model returns complete text but drops malformed rich-text-only `<style>` markers, recovery may render that paragraph with its base font style. Formula placeholders, citations, URLs, DOI values, and independent numeric values remain mandatory; content completeness takes priority over isolated font styling.
+- `fail_on_unresolved_translation` defaults to `true`. If bounded retries still leave a translatable paragraph unresolved, the original paragraph is preserved and the task is marked failed instead of publishing a silently incomplete PDF. References intentionally preserved in their original language are excluded from this audit.
 - BabelDOC is AGPL-3.0. Local personal use is straightforward; redistribution or providing a network service has source-code obligations.

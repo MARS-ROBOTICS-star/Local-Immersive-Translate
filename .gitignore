@@ -1,5 +1,6 @@
 # dot files
 .DS_Store
+.worktrees/
 
 # Node.js
 node_modules
