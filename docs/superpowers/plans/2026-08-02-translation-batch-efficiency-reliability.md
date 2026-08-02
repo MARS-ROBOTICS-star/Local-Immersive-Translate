@@ -25,6 +25,7 @@
 ### Task 0: Preserve the already-verified prerequisite fixes
 
 **Files:**
+
 - Verify: `local_babeldoc_server/babeldoc_compat.py`
 - Verify: `local_babeldoc_server/config.example.json`
 - Verify: `local_babeldoc_server/pdf_output_quality.py`
@@ -39,6 +40,7 @@
 - Verify: `tests/test_translator_adapters.py`
 
 **Interfaces:**
+
 - Consumes: the current dirty-tree fixes for the one-empty-paragraph Gemini failure, source-render audit, OCR provenance, and numeric-token fallback.
 - Produces: a clean prerequisite commit on `agent/pdf-translation-fixes` before new batching behavior is introduced.
 
@@ -84,12 +86,14 @@ git commit -m "fix: preserve pdf translation integrity"
 ### Task 1: Replace full stable IDs with compact batch aliases
 
 **Files:**
+
 - Modify: `local_babeldoc_server/translation_batching.py:58-247`
 - Modify: `local_babeldoc_server/translation_runtime.py:429-548`
 - Test: `tests/test_translation_batching.py`
 - Test: `tests/test_translation_runtime.py`
 
 **Interfaces:**
+
 - Consumes: `rewrite_babeldoc_batch_prompt(prompt: str, stable_ids: tuple[str, ...])` and BabelDOC's existing input marker.
 - Produces: `RewrittenBatchPrompt.alias_by_stable_id`, `stable_id_by_alias`, `source_by_stable_id`, compact `p/i/s` input, compact `t/i/t` output schema, and stable-ID response mapping.
 
@@ -215,6 +219,7 @@ git commit -m "perf: compact structured translation batches"
 ### Task 2: Enlarge batches and prove the historical request plan
 
 **Files:**
+
 - Modify: `local_babeldoc_server/translation_batching.py:18-55`
 - Modify: `local_babeldoc_server/babeldoc_compat.py:824-844`
 - Modify: `local_babeldoc_server/server.py:132-142,1080-1089`
@@ -223,6 +228,7 @@ git commit -m "perf: compact structured translation batches"
 - Test: `tests/test_server_translation_runtime.py`
 
 **Interfaces:**
+
 - Consumes: `partition_batch_indices(token_counts, target_tokens, max_tokens, max_paragraphs)`.
 - Produces: default limits 2400/3200/40 and a deterministic planner for the 358-paragraph five-page profile.
 
@@ -285,6 +291,7 @@ git commit -m "perf: enlarge safe translation batches"
 ### Task 3: Recover invalid items in grouped second-attempt batches
 
 **Files:**
+
 - Modify: `local_babeldoc_server/translation_batching.py`
 - Modify: `local_babeldoc_server/translation_runtime.py:312-548`
 - Modify: `local_babeldoc_server/babeldoc_compat.py:1035-1118`
@@ -294,6 +301,7 @@ git commit -m "perf: enlarge safe translation batches"
 - Test: `tests/test_babeldoc_compat.py`
 
 **Interfaces:**
+
 - Consumes: compact `RewrittenBatchPrompt`, `validate_translation()`, central `TranslationRuntime.request()`, and the existing two-exposure budget.
 - Produces: `build_recovery_batches()`, `RuntimeBackedTranslator.batch_item_outcome(stable_id)`, grouped `fallback` requests, and source-preserved exhaustion without a third request.
 
@@ -406,6 +414,7 @@ git commit -m "fix: recover failed batch items together"
 ### Task 4: Remove remote token counting and audit protocol overhead
 
 **Files:**
+
 - Modify: `local_babeldoc_server/translation_types.py:131-157`
 - Modify: `local_babeldoc_server/translator_adapters.py:61-69,121-173`
 - Modify: `local_babeldoc_server/translation_runtime.py:76-264`
@@ -415,6 +424,7 @@ git commit -m "fix: recover failed batch items together"
 - Test: `tests/test_translation_audit.py`
 
 **Interfaces:**
+
 - Consumes: complete `AdapterRequest` serialization and actual provider usage settlement.
 - Produces: network-free conservative token bounds and audit fields for phase, serialized bytes, schema bytes, protocol overhead, fill ratio, and recovery reasons.
 
@@ -503,10 +513,12 @@ git commit -m "fix: account for every translation request locally"
 ### Task 5: Deliver small source-preserved exceptions as warnings
 
 **Files:**
+
 - Modify: `local_babeldoc_server/server.py:277-413,1097-1181`
 - Test: `tests/test_local_babeldoc_server.py:466-597`
 
 **Interfaces:**
+
 - Consumes: tracking output, local quality `source_preserved` records, runtime abort reason, and generated PDF paths.
 - Produces: `TranslationAudit.source_preserved_count`, boolean warning disposition from `ensure_translation_complete()`, and a success job message that names warning counts.
 
@@ -602,11 +614,13 @@ git commit -m "fix: deliver isolated source-preserved warnings"
 ### Task 6: Apply the correct Gemini Lite price profile
 
 **Files:**
+
 - Modify: `local_babeldoc_server/server.py:40-100,764-856`
 - Modify: `local_babeldoc_server/config.example.json`
 - Test: `tests/test_server_translation_runtime.py`
 
 **Interfaces:**
+
 - Consumes: the resolved provider, model name, service tier, and existing `PricingSnapshot`.
 - Produces: `resolve_model_pricing(model_cfg)` with an explicit stable-model price map and a matching runtime snapshot.
 
@@ -679,11 +693,13 @@ git commit -m "fix: price Gemini Lite usage accurately"
 ### Task 7: Run complete offline regression and deploy the tested backend
 
 **Files:**
+
 - Verify: all files changed by Tasks 0-6
 - Update if behavior changed: `local_babeldoc_server/README.md`
 - Deploy after approval: `/home/lbz/Local-Immersive-Translate/local_babeldoc_server/`
 
 **Interfaces:**
+
 - Consumes: all task-level green tests and the existing local backend installation.
 - Produces: a tested workspace build, historical-profile measurements, and byte-identical deployed backend source files ready for the user's manual five-page test.
 

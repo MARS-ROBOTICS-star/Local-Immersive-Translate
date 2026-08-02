@@ -104,13 +104,13 @@ map.
 The existing translation instruction body is followed by a compact input object:
 
 ```json
-{"p":[{"i":"0","s":"source paragraph"}]}
+{ "p": [{ "i": "0", "s": "source paragraph" }] }
 ```
 
 The required output is:
 
 ```json
-{"t":[{"i":"0","t":"translated paragraph"}]}
+{ "t": [{ "i": "0", "t": "translated paragraph" }] }
 ```
 
 The schema keeps `additionalProperties: false`, requires both compact fields,
