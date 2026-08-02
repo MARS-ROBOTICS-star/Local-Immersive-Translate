@@ -115,6 +115,18 @@ class FakeILTranslator:
         paragraph.pdf_paragraph_composition = []
         return True
 
+    def get_translate_input(
+        self,
+        paragraph,
+        page_font_map=None,
+        disable_rich_text_translate=None,
+    ):
+        return self.TranslateInput(
+            paragraph.unicode,
+            [],
+            paragraph.pdf_style,
+        )
+
 
 class FakeLayoutParser:
     def __init__(self):
@@ -312,6 +324,113 @@ class FakeOcrRuntime:
 
 
 class BabeldocCompatTest(unittest.TestCase):
+    def test_paragraph_finder_marks_fallback_text_inside_native_table(self):
+        modules = fake_modules()
+        table_text = paragraph("Data", "fallback_line")
+        table_text.box = SimpleNamespace(x=470.0, y=540.0, x2=500.0, y2=552.0)
+        document = SimpleNamespace(
+            page=[
+                SimpleNamespace(
+                    pdf_paragraph=[table_text],
+                    page_layout=[
+                        SimpleNamespace(
+                            class_name="table",
+                            box=SimpleNamespace(
+                                x=85.0,
+                                y=535.0,
+                                x2=521.0,
+                                y2=705.0,
+                            ),
+                        )
+                    ],
+                )
+            ]
+        )
+
+        with patch.dict(sys.modules, modules):
+            handle = install_babeldoc_compat(
+                {"enable_native_table_translation": True}
+            )
+            finder = FakeParagraphFinder()
+            finder.process(document)
+            handle.restore()
+
+        self.assertIn(
+            id(table_text),
+            finder.translation_config.local_native_table_paragraph_object_ids,
+        )
+
+    def test_native_table_citation_is_rebuilt_as_unicode_without_model(self):
+        modules = fake_modules()
+        citation = paragraph("(Angelova et al., 2007)", "fallback_line")
+        citation.pdf_paragraph_composition = [SimpleNamespace(native_chars=True)]
+        tracker = FakeTracker()
+        translator = FakeILTranslator()
+        translator.translation_config.local_native_table_paragraph_object_ids = {
+            id(citation)
+        }
+
+        with patch.dict(sys.modules, modules):
+            handle = install_babeldoc_compat(
+                {"enable_native_table_translation": True}
+            )
+            result = translator.pre_translate_paragraph(
+                citation,
+                tracker,
+                {},
+                {},
+            )
+            handle.restore()
+
+        self.assertEqual(result, (None, None))
+        self.assertEqual(len(citation.pdf_paragraph_composition), 1)
+        rebuilt = citation.pdf_paragraph_composition[0]
+        self.assertIsInstance(rebuilt, PdfParagraphComposition)
+        self.assertEqual(
+            rebuilt.pdf_same_style_unicode_characters.unicode,
+            "(Angelova et al., 2007)",
+        )
+
+    def test_short_native_table_word_is_prepared_for_batch_translation(self):
+        modules = fake_modules()
+        source = paragraph("Data", "fallback_line")
+        tracker = FakeTracker()
+        original_pre_translate = FakeILTranslator.pre_translate_paragraph
+
+        def upstream_short_text_skip(
+            _self,
+            paragraph,
+            tracker,
+            _page_font_map,
+            _xobj_font_map,
+        ):
+            tracker.set_pdf_unicode(paragraph.unicode)
+            return None, None
+
+        FakeILTranslator.pre_translate_paragraph = upstream_short_text_skip
+        try:
+            with patch.dict(sys.modules, modules):
+                handle = install_babeldoc_compat(
+                    {"enable_native_table_translation": True}
+                )
+                translator = FakeILTranslator()
+                translator.translation_config.local_native_table_paragraph_object_ids = {
+                    id(source)
+                }
+                text, translate_input = translator.pre_translate_paragraph(
+                    source,
+                    tracker,
+                    {},
+                    {},
+                )
+                handle.restore()
+        finally:
+            FakeILTranslator.pre_translate_paragraph = original_pre_translate
+
+        self.assertEqual(text, "Data")
+        self.assertEqual(translate_input.unicode, "Data")
+        self.assertEqual(tracker.input, "Data")
+
     def test_source_preserved_batch_item_does_not_trigger_third_request(self):
         modules = fake_modules()
         source = paragraph(

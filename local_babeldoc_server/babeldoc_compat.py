@@ -362,6 +362,66 @@ def _box_overlap_ratio(inner: Any, outer: Any) -> float:
     return intersection_width * intersection_height / area
 
 
+def _find_native_table_paragraph_object_ids(document: Any) -> set[int]:
+    object_ids: set[int] = set()
+    for page in getattr(document, "page", []):
+        table_boxes = [
+            getattr(layout, "box", None)
+            for layout in getattr(page, "page_layout", [])
+            if getattr(layout, "class_name", None) == "table"
+            and getattr(layout, "box", None) is not None
+        ]
+        if not table_boxes:
+            continue
+        for paragraph in getattr(page, "pdf_paragraph", []):
+            paragraph_box = getattr(paragraph, "box", None)
+            if any(
+                _box_overlap_ratio(paragraph_box, table_box) >= 0.5
+                for table_box in table_boxes
+            ):
+                object_ids.add(id(paragraph))
+    return object_ids
+
+
+def _is_native_table_paragraph(
+    translation_config: Any,
+    paragraph: Any,
+) -> bool:
+    object_ids = getattr(
+        translation_config,
+        "local_native_table_paragraph_object_ids",
+        (),
+    )
+    return id(paragraph) in object_ids
+
+
+def _rebuild_native_table_paragraph(il_version: Any, paragraph: Any) -> None:
+    source_text = getattr(paragraph, "unicode", "") or ""
+    style = getattr(paragraph, "pdf_style", None)
+    same_style = il_version.PdfSameStyleUnicodeCharacters(
+        unicode=source_text,
+        pdf_style=style,
+        debug_info=False,
+    )
+    paragraph.pdf_paragraph_composition = [
+        il_version.PdfParagraphComposition(
+            pdf_same_style_unicode_characters=same_style,
+        )
+    ]
+
+
+def _is_translatable_short_table_text(text: str, min_length: int) -> bool:
+    normalized = _INLINE_PLACEHOLDER_RE.sub("", text).strip()
+    if not normalized or len(normalized) >= min_length:
+        return False
+    if _is_nontranslatable_literal(normalized):
+        return False
+    return bool(
+        re.fullmatch(r"[A-Za-z][A-Za-z .-]*", normalized)
+        and re.search(r"[a-z]", normalized)
+    )
+
+
 def _remove_reference_backgrounds(page: Any, references: list[Any]) -> None:
     reference_boxes = [
         getattr(paragraph, "box", None)
@@ -575,6 +635,7 @@ def install_babeldoc_compat(
     )
     paragraph_finder = paragraph_module.ParagraphFinder
     il_translator = translator_module.ILTranslator
+    il_version = import_module("babeldoc.format.pdf.document_il.il_version_1")
     translation_config_class = translation_config_module.TranslationConfig
     typesetting_class = typesetting_module.Typesetting
     llm_only_translator = None
@@ -677,6 +738,9 @@ def install_babeldoc_compat(
 
     preserve_references = bool(config.get("preserve_references", True))
     preserve_toc_layout = bool(config.get("preserve_toc_layout", True))
+    enable_native_table_translation = bool(
+        config.get("enable_native_table_translation", True)
+    )
     quality_guard_enabled = bool(
         config.get("enable_translation_quality_guard", True)
     )
@@ -687,12 +751,22 @@ def install_babeldoc_compat(
 
     def wrapped_process(self, document):
         result = original_process(self, document)
+        native_table_paragraph_object_ids: set[int] = set()
+        if enable_native_table_translation:
+            native_table_paragraph_object_ids = (
+                _find_native_table_paragraph_object_ids(document)
+            )
+        self.translation_config.local_native_table_paragraph_object_ids = (
+            native_table_paragraph_object_ids
+        )
         stats = mark_document_structure(document)
         self.translation_config.local_structure_stats = stats
         logger.info(
-            "PDF structure detection: references=%s toc_entries=%s",
+            "PDF structure detection: references=%s toc_entries=%s "
+            "native_table_paragraphs=%s",
             stats.reference_paragraphs,
             stats.toc_entries,
+            len(native_table_paragraph_object_ids),
         )
         return result
 
@@ -730,10 +804,22 @@ def install_babeldoc_compat(
             return result
 
         source_text = (getattr(paragraph, "unicode", "") or "").strip()
+        is_native_table_text = bool(
+            enable_native_table_translation
+            and _is_native_table_paragraph(
+                self.translation_config,
+                paragraph,
+            )
+        )
         if _is_nontranslatable_literal(source_text):
             _call_tracker(tracker, "set_pdf_unicode", source_text)
+            if is_native_table_text:
+                _rebuild_native_table_paragraph(il_version, paragraph)
             return None, None
-        if preserve_references and getattr(paragraph, "layout_label", None) == REFERENCE_LABEL:
+        if (
+            preserve_references
+            and getattr(paragraph, "layout_label", None) == REFERENCE_LABEL
+        ):
             _call_tracker(
                 tracker,
                 "set_pdf_unicode",
@@ -758,15 +844,61 @@ def install_babeldoc_compat(
             if callable(setter):
                 setter({})
             return record_batch_id((source_text, translate_input))
-        return record_batch_id(
-            original_pre_translate(
-                self,
-                paragraph,
-                tracker,
-                page_font_map,
-                xobj_font_map,
-            )
+
+        min_text_length = int(
+            getattr(self.translation_config, "min_text_length", 5)
         )
+        if is_native_table_text and _is_translatable_short_table_text(
+            source_text,
+            min_text_length,
+        ):
+            effective_font_map = page_font_map
+            xobj_id = getattr(paragraph, "xobj_id", None)
+            if xobj_id in xobj_font_map:
+                effective_font_map = xobj_font_map[xobj_id]
+            disable_rich_text_translate = bool(
+                getattr(
+                    self.translation_config,
+                    "disable_rich_text_translate",
+                    False,
+                )
+            )
+            if not getattr(self, "support_llm_translate", False):
+                disable_rich_text_translate = True
+            translate_input = self.get_translate_input(
+                paragraph,
+                effective_font_map,
+                disable_rich_text_translate,
+            )
+            if translate_input is not None:
+                _call_tracker(tracker, "set_pdf_unicode", source_text)
+                _call_tracker(tracker, "set_input", translate_input.unicode)
+                _call_tracker(
+                    tracker,
+                    "set_placeholders",
+                    translate_input.placeholders,
+                )
+                _call_tracker(
+                    tracker,
+                    "set_original_placeholders",
+                    getattr(
+                        translate_input,
+                        "original_placeholder_tokens",
+                        None,
+                    ),
+                )
+                return record_batch_id((translate_input.unicode, translate_input))
+
+        result = original_pre_translate(
+            self,
+            paragraph,
+            tracker,
+            page_font_map,
+            xobj_font_map,
+        )
+        if is_native_table_text and (not result or result[0] is None):
+            _rebuild_native_table_paragraph(il_version, paragraph)
+        return record_batch_id(result)
 
     def wrapped_batch_translate(self, *args, **kwargs):
         context_factory = getattr(
@@ -804,11 +936,46 @@ def install_babeldoc_compat(
                 continue
             if paragraph.debug_id is None or paragraph.unicode is None:
                 continue
+            is_native_table_text = bool(
+                enable_native_table_translation
+                and _is_native_table_paragraph(
+                    self.translation_config,
+                    paragraph,
+                )
+            )
+            source_text = paragraph.unicode
+            min_text_length = int(
+                getattr(self.translation_config, "min_text_length", 5)
+            )
+            is_short = len(source_text) < min_text_length
+            translate_short = bool(
+                is_native_table_text
+                and _is_translatable_short_table_text(
+                    source_text,
+                    min_text_length,
+                )
+            )
+            cid_paragraph = is_cid(paragraph)
+            numeric_paragraph = is_numeric(paragraph)
+            placeholder_paragraph = is_placeholder(paragraph)
+            nontranslatable_literal = _is_nontranslatable_literal(source_text)
             if (
-                is_cid(paragraph)
-                or len(paragraph.unicode) < self.translation_config.min_text_length
-                or is_numeric(paragraph)
-                or is_placeholder(paragraph)
+                is_native_table_text
+                and not cid_paragraph
+                and not placeholder_paragraph
+                and (
+                    nontranslatable_literal
+                    or numeric_paragraph
+                    or (is_short and not translate_short)
+                )
+            ):
+                _rebuild_native_table_paragraph(il_version, paragraph)
+            if (
+                cid_paragraph
+                or (is_short and not translate_short)
+                or numeric_paragraph
+                or placeholder_paragraph
+                or nontranslatable_literal
             ):
                 if pbar:
                     pbar.advance(1)
