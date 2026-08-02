@@ -11,6 +11,50 @@ class BatchPromptError(RuntimeError):
     pass
 
 
+class OversizedParagraphError(ValueError):
+    pass
+
+
+def partition_batch_indices(
+    token_counts: list[int] | tuple[int, ...],
+    *,
+    target_tokens: int = 1000,
+    max_tokens: int = 1500,
+    max_paragraphs: int = 16,
+) -> tuple[tuple[int, int], ...]:
+    if target_tokens < 1 or max_tokens < target_tokens:
+        raise ValueError("batch token limits are invalid")
+    if max_paragraphs < 1:
+        raise ValueError("max_paragraphs must be positive")
+    batches: list[tuple[int, int]] = []
+    start = 0
+    total = 0
+    count = 0
+    for index, raw_tokens in enumerate(token_counts):
+        tokens = max(0, int(raw_tokens))
+        if tokens > max_tokens:
+            raise OversizedParagraphError(
+                f"paragraph {index} exceeds {max_tokens} source tokens"
+            )
+        if count and (
+            total + tokens > max_tokens or count >= max_paragraphs
+        ):
+            batches.append((start, index))
+            start = index
+            total = 0
+            count = 0
+        total += tokens
+        count += 1
+        if total >= target_tokens or count >= max_paragraphs:
+            batches.append((start, index + 1))
+            start = index + 1
+            total = 0
+            count = 0
+    if count:
+        batches.append((start, len(token_counts)))
+    return tuple(batches)
+
+
 @dataclass(frozen=True, slots=True)
 class BatchValidation:
     expected_ids: tuple[str, ...]

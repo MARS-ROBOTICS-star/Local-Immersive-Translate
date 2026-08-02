@@ -6,6 +6,7 @@ import unittest
 from local_babeldoc_server.translation_batching import build_translation_schema
 from local_babeldoc_server.translation_batching import rewrite_batch_response_for_babeldoc
 from local_babeldoc_server.translation_batching import rewrite_babeldoc_batch_prompt
+from local_babeldoc_server.translation_batching import partition_batch_indices
 from local_babeldoc_server.translation_batching import validate_translation_set
 
 
@@ -13,6 +14,21 @@ EXPECTED = ("part-001/page-003/paragraph-007", "part-001/page-003/paragraph-008"
 
 
 class TranslationBatchingTest(unittest.TestCase):
+    def test_partition_targets_1000_tokens_without_old_five_paragraph_cutoff(self) -> None:
+        batches = partition_batch_indices([90] * 17)
+
+        self.assertEqual(batches, ((0, 12), (12, 17)))
+        self.assertGreater(batches[0][1] - batches[0][0], 5)
+
+    def test_partition_never_exceeds_1500_tokens_or_16_paragraphs(self) -> None:
+        token_counts = [800, 600, 200] + [70] * 20
+
+        batches = partition_batch_indices(token_counts)
+
+        for start, end in batches:
+            self.assertLessEqual(sum(token_counts[start:end]), 1500)
+            self.assertLessEqual(end - start, 16)
+
     def test_schema_has_exact_ids_count_and_closed_objects(self) -> None:
         schema = build_translation_schema(EXPECTED)
 
