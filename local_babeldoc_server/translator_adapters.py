@@ -147,7 +147,13 @@ class GeminiInteractionsAdapter:
             self.client = client
             return
         if client_factory is None:
-            from google import genai
+            try:
+                from google import genai
+            except ImportError as exc:
+                raise ModelConfigurationError(
+                    "Gemini requires google-genai; reinstall the local "
+                    "backend dependencies"
+                ) from exc
 
             client_factory = genai.Client
         self.client = client_factory(
@@ -183,16 +189,18 @@ class GeminiInteractionsAdapter:
     def send(self, request: AdapterRequest) -> AdapterResponse:
         self.validate_request(request)
         level = request.reasoning_level or "minimal"
-        response = self.client.interactions.create(
-            model=self.model,
-            input=request.input,
-            response_format=request.response_format,
-            generation_config={
+        options: dict[str, Any] = {
+            "model": self.model,
+            "input": request.input,
+            "generation_config": {
                 "thinking_level": level,
                 "max_output_tokens": request.max_output_tokens,
             },
-            store=False,
-        )
+            "store": False,
+        }
+        if request.response_format is not None:
+            options["response_format"] = request.response_format
+        response = self.client.interactions.create(**options)
         usage = _value(response, "usage")
         normalized_usage = NormalizedUsage(
             prompt_tokens=_nullable_int(
@@ -341,6 +349,84 @@ class OpenAICompatibleAdapter:
         return _classify_transport_error(error)
 
 
+DEEPSEEK_CHAT_CAPABILITIES = ProviderCapabilities(
+    supports_structured_output=True,
+    supports_reasoning_control=True,
+    supported_reasoning_levels=frozenset({"minimal"}),
+    exposes_reasoning_usage=False,
+    supports_cached_usage=True,
+    supports_count_tokens=False,
+    supports_request_id=True,
+)
+
+
+class DeepSeekChatAdapter(OpenAICompatibleAdapter):
+    """DeepSeek chat-completions contract with paid thinking disabled."""
+
+    def __init__(
+        self,
+        *,
+        api_key: str,
+        base_url: str,
+        model: str,
+        client: Any = None,
+        client_factory: Callable[..., Any] | None = None,
+    ) -> None:
+        super().__init__(
+            api_key=api_key,
+            base_url=base_url,
+            model=model,
+            capabilities=DEEPSEEK_CHAT_CAPABILITIES,
+            default_billable_reasoning=False,
+            client=client,
+            client_factory=client_factory,
+        )
+
+    def send(self, request: AdapterRequest) -> AdapterResponse:
+        self.validate_request(request)
+        messages = request.input
+        if isinstance(messages, str):
+            messages = [{"role": "user", "content": messages}]
+        options: dict[str, Any] = {
+            "model": self.model,
+            "messages": messages,
+            "max_tokens": request.max_output_tokens,
+            "extra_body": {"thinking": {"type": "disabled"}},
+        }
+        if request.response_format is not None:
+            options["response_format"] = {"type": "json_object"}
+        if request.extra_headers:
+            options["extra_headers"] = dict(request.extra_headers)
+        response = self.client.chat.completions.create(**options)
+        choices = _value(response, "choices") or []
+        choice = choices[0] if choices else None
+        message = _value(choice, "message")
+        usage = _value(response, "usage")
+        cached_tokens = _nullable_int(
+            _value(usage, "prompt_cache_hit_tokens")
+        )
+        if cached_tokens is None:
+            prompt_details = _value(usage, "prompt_tokens_details")
+            cached_tokens = _nullable_int(
+                _value(prompt_details, "cached_tokens")
+            )
+        return AdapterResponse(
+            output_text=str(_value(message, "content") or ""),
+            usage=NormalizedUsage(
+                prompt_tokens=_nullable_int(_value(usage, "prompt_tokens")),
+                visible_completion_tokens=_nullable_int(
+                    _value(usage, "completion_tokens")
+                ),
+                reasoning_tokens=0,
+                cached_tokens=cached_tokens,
+                tool_use_tokens=None,
+                total_tokens=_nullable_int(_value(usage, "total_tokens")),
+            ),
+            provider_request_id=_value(response, "id"),
+            finish_reason=_value(choice, "finish_reason"),
+        )
+
+
 def _capabilities_from_config(
     config: Mapping[str, Any],
 ) -> ProviderCapabilities:
@@ -388,6 +474,14 @@ def resolve_adapter(
     if api_surface not in {"", "openai-chat-completions"}:
         raise ModelConfigurationError(
             f"unsupported API surface: {api_surface}"
+        )
+    if provider == "deepseek":
+        return DeepSeekChatAdapter(
+            api_key=str(model_config.get("api_key") or ""),
+            base_url=str(model_config.get("base_url") or ""),
+            model=str(model_config.get("model") or ""),
+            client=client,
+            client_factory=client_factory,
         )
     capabilities = _capabilities_from_config(
         model_config.get("capabilities") or {}

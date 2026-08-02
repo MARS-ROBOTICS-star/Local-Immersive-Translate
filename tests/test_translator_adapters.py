@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import unittest
+import builtins
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from local_babeldoc_server.translation_types import AdapterRequest
 from local_babeldoc_server.translation_types import ProviderCapabilities
 from local_babeldoc_server.translator_adapters import GeminiInteractionsAdapter
+from local_babeldoc_server.translator_adapters import DeepSeekChatAdapter
 from local_babeldoc_server.translator_adapters import ModelConfigurationError
 from local_babeldoc_server.translator_adapters import OpenAICompatibleAdapter
 from local_babeldoc_server.translator_adapters import (
@@ -73,6 +76,90 @@ MINIMAL_CAPABILITIES = ProviderCapabilities(
 
 
 class TranslatorAdaptersTest(unittest.TestCase):
+    def test_missing_google_sdk_reports_backend_reinstall_action(self) -> None:
+        original_import = builtins.__import__
+
+        def import_without_google(name, *args, **kwargs):
+            if name == "google":
+                raise ImportError("cannot import name 'genai' from 'google'")
+            return original_import(name, *args, **kwargs)
+
+        with patch("builtins.__import__", side_effect=import_without_google):
+            with self.assertRaisesRegex(
+                ModelConfigurationError,
+                "google-genai.*reinstall the local backend dependencies",
+            ):
+                GeminiInteractionsAdapter(
+                    api_key="secret",
+                    model="gemini-3.6-flash",
+                )
+
+    def test_deepseek_uses_json_object_disables_thinking_and_maps_cache(self) -> None:
+        usage = SimpleNamespace(
+            prompt_tokens=120,
+            completion_tokens=30,
+            total_tokens=150,
+            prompt_cache_hit_tokens=45,
+            prompt_cache_miss_tokens=75,
+        )
+        completions = RecordingChatCompletions(openai_response(usage=usage))
+        client = SimpleNamespace(
+            chat=SimpleNamespace(completions=completions)
+        )
+        adapter = DeepSeekChatAdapter(
+            api_key="secret",
+            base_url="https://api.deepseek.com",
+            model="deepseek-chat",
+            client=client,
+        )
+
+        response = adapter.send(
+            AdapterRequest(
+                model="deepseek-chat",
+                input="translate",
+                max_output_tokens=2048,
+                response_format={
+                    "type": "text",
+                    "mime_type": "application/json",
+                    "schema": {"type": "object"},
+                },
+                reasoning_level="minimal",
+            )
+        )
+
+        sent = completions.calls[0]
+        self.assertEqual(sent["response_format"], {"type": "json_object"})
+        self.assertEqual(
+            sent["extra_body"],
+            {"thinking": {"type": "disabled"}},
+        )
+        self.assertNotIn("reasoning_effort", sent)
+        self.assertEqual(response.usage.prompt_tokens, 120)
+        self.assertEqual(response.usage.cached_tokens, 45)
+        self.assertEqual(response.usage.visible_completion_tokens, 30)
+        self.assertEqual(response.usage.reasoning_tokens, 0)
+        self.assertEqual(response.usage.total_tokens, 150)
+
+    def test_resolver_selects_deepseek_adapter_by_provider_capability(self) -> None:
+        client = SimpleNamespace(
+            chat=SimpleNamespace(
+                completions=RecordingChatCompletions(openai_response())
+            )
+        )
+
+        adapter = resolve_adapter(
+            {
+                "provider": "deepseek",
+                "api_surface": "openai-chat-completions",
+                "base_url": "https://api.deepseek.com",
+                "api_key": "secret",
+                "model": "deepseek-chat",
+            },
+            client=client,
+        )
+
+        self.assertIsInstance(adapter, DeepSeekChatAdapter)
+
     def test_gemini_uses_v1_stateless_minimal_structured_request(self) -> None:
         usage = SimpleNamespace(
             total_input_tokens=120,
@@ -132,6 +219,41 @@ class TranslatorAdaptersTest(unittest.TestCase):
         self.assertEqual(response.usage.cached_tokens, 40)
         self.assertEqual(response.usage.tool_use_tokens, 0)
         self.assertEqual(response.usage.total_tokens, 157)
+
+    def test_gemini_omits_response_format_for_plain_text_fallback(self) -> None:
+        interaction = SimpleNamespace(
+            id="interaction-plain-1",
+            output_text="译文",
+            status="completed",
+            steps=[],
+            usage=SimpleNamespace(
+                total_input_tokens=10,
+                total_output_tokens=2,
+                total_thought_tokens=0,
+                total_cached_tokens=0,
+                total_tool_use_tokens=0,
+                total_tokens=12,
+            ),
+        )
+        interactions = RecordingInteractions(interaction)
+        adapter = GeminiInteractionsAdapter(
+            api_key="secret",
+            model="gemini-3.6-flash",
+            client=SimpleNamespace(interactions=interactions),
+        )
+
+        response = adapter.send(
+            AdapterRequest(
+                model="gemini-3.6-flash",
+                input="Translate this plain text.",
+                max_output_tokens=2048,
+                response_format=None,
+                reasoning_level="minimal",
+            )
+        )
+
+        self.assertEqual(response.output_text, "译文")
+        self.assertNotIn("response_format", interactions.calls[0])
 
     def test_openai_client_disables_retries_and_omits_reasoning_for_plain_model(self) -> None:
         completions = RecordingChatCompletions(openai_response())

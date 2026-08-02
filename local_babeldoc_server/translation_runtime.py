@@ -327,6 +327,9 @@ class RuntimeBackedTranslator:
         if stable_ids is not None:
             stable_ids.append(str(stable_id))
 
+    def is_batch_context_active(self) -> bool:
+        return getattr(self._batch_local, "stable_ids", None) is not None
+
     @contextmanager
     def paragraph_context(
         self,
@@ -440,17 +443,23 @@ class RuntimeBackedTranslator:
         if mode == "llm" and batch_ids and params.get("request_json_mode"):
             rewritten_batch = rewrite_babeldoc_batch_prompt(text, batch_ids)
             text = rewritten_batch.prompt
-        stable_ids = tuple(
-            str(value)
-            for value in (
+        paragraph_stable_id = getattr(
+            self._batch_local,
+            "paragraph_stable_id",
+            None,
+        )
+        stable_id_source = (
+            (paragraph_stable_id,)
+            if mode == "simple" and paragraph_stable_id
+            else (
                 batch_ids
                 or params.get("stable_ids", ())
-                or (
-                    (getattr(self._batch_local, "paragraph_stable_id"),)
-                    if getattr(self._batch_local, "paragraph_stable_id", None)
-                    else ()
-                )
+                or ((paragraph_stable_id,) if paragraph_stable_id else ())
             )
+        )
+        stable_ids = tuple(
+            str(value)
+            for value in stable_id_source
         )
         category = str(
             params.get("request_category")
@@ -542,6 +551,8 @@ class RuntimeBackedTranslator:
         return (
             "You are a professional, authentic machine translation engine. "
             f"Translate the following plain text into {self.lang_out}. "
+            "Preserve every number and unit exactly as written; do not "
+            "convert numeric notation into words or different units. "
             "Return the translation only.\n\n"
             f"{text}"
         )

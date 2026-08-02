@@ -283,6 +283,49 @@ class TranslationRuntimeTest(unittest.TestCase):
             self.assertEqual(translator.translate_call_count, 2)
             self.assertEqual(translator.token_count.value, 250)
 
+    def test_runtime_translator_reports_active_batch_context(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            adapter = FakeAdapter([])
+            runtime, _budget, _writer = self.make_runtime(directory, adapter)
+            translator = RuntimeBackedTranslator(
+                runtime=runtime,
+                lang_in="en",
+                lang_out="zh",
+                model="fake-model",
+            )
+
+            reports_batch = getattr(
+                translator,
+                "is_batch_context_active",
+                lambda: False,
+            )
+            self.assertFalse(reports_batch())
+            with translator.batch_context(("p001",)):
+                self.assertTrue(reports_batch())
+            self.assertFalse(reports_batch())
+
+    def test_simple_fallback_tells_provider_to_preserve_numeric_tokens(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            adapter = FakeAdapter([response("共计 120 000 K 张图像")])
+            runtime, _budget, _writer = self.make_runtime(directory, adapter)
+            translator = RuntimeBackedTranslator(
+                runtime=runtime,
+                lang_in="en",
+                lang_out="zh",
+                model="fake-model",
+            )
+
+            translator.translate(
+                "Total 120 000 K images",
+                rate_limit_params={"stable_ids": ("p001",)},
+            )
+
+            sent_prompt = adapter.sent_requests[0].input
+            self.assertIn(
+                "Preserve every number and unit exactly as written",
+                sent_prompt,
+            )
+
     def test_terminology_translator_uses_its_own_category_without_paragraph_attempts(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             adapter = FakeAdapter([response('{"terms": []}')])
@@ -396,6 +439,51 @@ class TranslationRuntimeTest(unittest.TestCase):
 
             self.assertEqual(adapter.send_count, 2)
             self.assertEqual(budget.snapshot().semantic_attempts[stable_id], 2)
+
+    def test_nested_batch_fallback_charges_only_current_paragraph(self) -> None:
+        stable_ids = ("p001", "p002")
+        batch_response = AdapterResponse(
+            output_text=(
+                '{"translations":['
+                '{"id":"p001","translation":"第一段"},'
+                '{"id":"p002","translation":"第二段"}]}'
+            ),
+            provider_request_id="provider-batch",
+            finish_reason="completed",
+            usage=response().usage,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            adapter = FakeAdapter([batch_response, response("修复后的第一段")])
+            runtime, budget, writer = self.make_runtime(directory, adapter)
+            translator = RuntimeBackedTranslator(
+                runtime=runtime,
+                lang_in="en",
+                lang_out="zh",
+                model="fake-model",
+            )
+            upstream_prompt = (
+                "rules\n\n## Here is the input:\n\n"
+                '[{"id":0,"input":"First"},{"id":1,"input":"Second"}]'
+            )
+
+            with translator.batch_context(stable_ids):
+                translator.llm_translate(
+                    upstream_prompt,
+                    rate_limit_params={"request_json_mode": True},
+                )
+                with translator.paragraph_context("p001", "fallback"):
+                    translator.translate("First", ignore_cache=True)
+
+            snapshot = budget.snapshot()
+            self.assertEqual(snapshot.semantic_attempts["p001"], 2)
+            self.assertEqual(snapshot.semantic_attempts["p002"], 1)
+            records = [
+                json.loads(line)
+                for line in writer.jsonl_path.read_text(
+                    encoding="utf-8"
+                ).splitlines()
+            ]
+            self.assertEqual(records[1]["paragraph_ids"], ["p001"])
 
     def test_close_refuses_to_hide_unsettled_in_flight_requests(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

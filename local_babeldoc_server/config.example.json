@@ -45,6 +45,8 @@
     "max_ocr_blocks_per_table": 100,
     "max_table_ocr_to_native_ratio": 0.5,
     "ratio_check_min_native_paragraphs": 20,
+    "min_table_translation_scale": 0.55,
+    "table_bbox_tolerance": 0.5,
     "fail_on_unresolved_translation": true
   },
   "models": {
@@ -62,6 +64,8 @@
     },
     "deepseek": {
       "label": "DeepSeek",
+      "provider": "deepseek",
+      "api_surface": "openai-chat-completions",
       "base_url": "",
       "api_key": "env:DEEPSEEK_API_KEY",
       "model": "",

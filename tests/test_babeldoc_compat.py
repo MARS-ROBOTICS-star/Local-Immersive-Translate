@@ -1,11 +1,15 @@
 import sys
+import tempfile
 import types
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
 from local_babeldoc_server.babeldoc_compat import install_babeldoc_compat
 from local_babeldoc_server.babeldoc_compat import inject_ocr_table_paragraphs
+from local_babeldoc_server.babeldoc_compat import OcrSafetyError
+from local_babeldoc_server.babeldoc_compat import register_document_origins_and_validate
 from local_babeldoc_server.babeldoc_compat import translate_toc_paragraph
 from local_babeldoc_server.structure_rules import REFERENCE_LABEL
 from local_babeldoc_server.structure_rules import TOC_LABEL
@@ -19,6 +23,8 @@ IL_MODULE = "babeldoc.format.pdf.document_il.il_version_1"
 LAYOUT_MODULE = "babeldoc.format.pdf.document_il.midend.layout_parser"
 PDF_CREATER_MODULE = "babeldoc.format.pdf.document_il.backend.pdf_creater"
 STYLES_MODULE = "babeldoc.format.pdf.document_il.midend.styles_and_formulas"
+TRANSLATION_CONFIG_MODULE = "babeldoc.format.pdf.translation_config"
+TYPESETTING_MODULE = "babeldoc.format.pdf.document_il.midend.typesetting"
 
 
 class FlexibleIlObject:
@@ -142,8 +148,42 @@ class FakeRectangleRenderUnit:
 
 
 class FakePDFCreater:
+    subset_calls = []
+
     def create_render_units_for_page(self, page, translation_config):
         return [SimpleNamespace(kind="original", render_order=1)]
+
+    @staticmethod
+    def subset_fonts_in_subprocess(pdf, translation_config, tag):
+        FakePDFCreater.subset_calls.append((pdf, translation_config, tag))
+        return ("subset", pdf)
+
+
+class FakeTranslationConfig:
+    def __init__(self, working_dir):
+        self.working_dir = working_dir
+        self._part_working_dirs = {}
+
+    def cleanup_part_working_dir(self, part_index):
+        import shutil
+
+        part_dir = self._part_working_dirs.pop(part_index, None)
+        if part_dir is not None:
+            shutil.rmtree(part_dir, ignore_errors=True)
+
+
+class FakeTypesetting:
+    def __init__(self):
+        self.translation_config = SimpleNamespace()
+
+    def typesetting_document(self, document):
+        for page in document.page:
+            for item in page.pdf_paragraph:
+                item.scale = getattr(item, "requested_scale", 1.0)
+                expanded_box = getattr(item, "requested_box", None)
+                if expanded_box is not None:
+                    item.box = expanded_box
+        return document
 
 
 def fake_modules():
@@ -169,6 +209,10 @@ def fake_modules():
     pdf_creater_module.RectangleRenderUnit = FakeRectangleRenderUnit
     styles_module = types.ModuleType(STYLES_MODULE)
     styles_module.StylesAndFormulas = FakeStylesAndFormulas
+    translation_config_module = types.ModuleType(TRANSLATION_CONFIG_MODULE)
+    translation_config_module.TranslationConfig = FakeTranslationConfig
+    typesetting_module = types.ModuleType(TYPESETTING_MODULE)
+    typesetting_module.Typesetting = FakeTypesetting
     return {
         "babeldoc": babeldoc,
         PARAGRAPH_MODULE: paragraph_module,
@@ -177,6 +221,8 @@ def fake_modules():
         LAYOUT_MODULE: layout_module,
         PDF_CREATER_MODULE: pdf_creater_module,
         STYLES_MODULE: styles_module,
+        TRANSLATION_CONFIG_MODULE: translation_config_module,
+        TYPESETTING_MODULE: typesetting_module,
     }
 
 
@@ -218,12 +264,22 @@ class FakeTranslateEngine:
 
 
 class FakeQueuedLLMEngine:
-    def __init__(self, outputs, require_cache_bypass=False, simple_outputs=None):
+    def __init__(
+        self,
+        outputs,
+        require_cache_bypass=False,
+        simple_outputs=None,
+        batch_active=False,
+    ):
         self.outputs = list(outputs)
         self.inputs = []
         self.require_cache_bypass = require_cache_bypass
         self.simple_outputs = list(simple_outputs or [])
         self.simple_inputs = []
+        self.batch_active = batch_active
+
+    def is_batch_context_active(self):
+        return self.batch_active
 
     def llm_translate(self, text, ignore_cache=False, rate_limit_params=None):
         self.inputs.append(text)
@@ -250,6 +306,150 @@ class FakeOcrRuntime:
 
 
 class BabeldocCompatTest(unittest.TestCase):
+    def test_batch_quality_rejection_uses_one_validated_fallback(self):
+        modules = fake_modules()
+        source = paragraph("Total 120 000 K images (10 K instance")
+        tracker = FakeTracker()
+        translator = FakeILTranslator()
+        translator.translate_engine = FakeQueuedLLMEngine(
+            [],
+            simple_outputs=["共计 120 000 K 张图像（10 K 实例"],
+            batch_active=True,
+        )
+        translate_input = translator.TranslateInput(
+            source.unicode,
+            [],
+            source.pdf_style,
+        )
+
+        with patch.dict(sys.modules, modules):
+            handle = install_babeldoc_compat(
+                {"preserve_references": True, "preserve_toc_layout": True}
+            )
+            result = translator.post_translate_paragraph(
+                source,
+                tracker,
+                translate_input,
+                "共计 12 万张图像（1 万实例",
+            )
+            handle.restore()
+
+        self.assertTrue(result)
+        self.assertEqual(source.unicode, "共计 120 000 K 张图像（10 K 实例")
+        self.assertEqual(
+            translator.translate_engine.simple_inputs,
+            ["Total 120 000 K images (10 K instance"],
+        )
+        quality = translator.translation_config.local_translation_quality
+        self.assertEqual(quality["recovered_count"], 1)
+        self.assertEqual(quality["unresolved_count"], 0)
+
+    def test_citation_and_url_literals_bypass_model_translation(self):
+        modules = fake_modules()
+        translator = FakeILTranslator()
+
+        with patch.dict(sys.modules, modules):
+            handle = install_babeldoc_compat(
+                {"preserve_references": True, "preserve_toc_layout": True}
+            )
+            for source_text in (
+                "(Wellhausen et al., 2019){v1}",
+                "https://unmannedlab.github.io/research/",
+            ):
+                with self.subTest(source_text=source_text):
+                    tracker = FakeTracker()
+                    result = translator.pre_translate_paragraph(
+                        paragraph(source_text),
+                        tracker,
+                        None,
+                        None,
+                    )
+                    self.assertEqual(result, (None, None))
+                    self.assertEqual(tracker.pdf_unicode, source_text)
+            handle.restore()
+
+    def test_table_layout_rejects_cell_bbox_expansion(self):
+        modules = fake_modules()
+        table_cell = paragraph("translated", "table")
+        table_cell.requested_scale = 0.8
+        table_cell.requested_box = SimpleNamespace(
+            x=40.0,
+            y=100.0,
+            x2=620.0,
+            y2=112.0,
+        )
+        document = SimpleNamespace(
+            page=[SimpleNamespace(page_number=20, pdf_paragraph=[table_cell])]
+        )
+
+        with patch.dict(sys.modules, modules):
+            handle = install_babeldoc_compat(
+                {
+                    "preserve_references": True,
+                    "preserve_toc_layout": True,
+                    "min_table_translation_scale": 0.55,
+                }
+            )
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "table_layout_unsafe.*page=21.*bbox_expanded",
+            ):
+                FakeTypesetting().typesetting_document(document)
+            handle.restore()
+
+    def test_table_layout_rejects_extreme_font_shrink(self):
+        modules = fake_modules()
+        table_cell = paragraph("A translated table cell", "table")
+        table_cell.requested_scale = 0.2
+        document = SimpleNamespace(
+            page=[SimpleNamespace(page_number=13, pdf_paragraph=[table_cell])]
+        )
+
+        with patch.dict(sys.modules, modules):
+            handle = install_babeldoc_compat(
+                {
+                    "preserve_references": True,
+                    "preserve_toc_layout": True,
+                    "min_table_translation_scale": 0.55,
+                }
+            )
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "table_layout_unsafe.*page=14.*scale=0.200",
+            ):
+                FakeTypesetting().typesetting_document(document)
+            handle.restore()
+
+    def test_split_cleanup_preserves_tracking_for_completion_audit(self):
+        modules = fake_modules()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            working_dir = Path(temp_dir)
+            part_dir = working_dir / "part_0"
+            part_dir.mkdir()
+            tracking = part_dir / "translate_tracking.json"
+            tracking.write_text('{"page": []}', encoding="utf-8")
+            config = FakeTranslationConfig(working_dir)
+            config._part_working_dirs[0] = part_dir
+
+            with patch.dict(sys.modules, modules):
+                handle = install_babeldoc_compat(
+                    {"preserve_references": True, "preserve_toc_layout": True}
+                )
+                config.cleanup_part_working_dir(0)
+                handle.restore()
+
+            preserved = (
+                working_dir
+                / "translation_tracking_parts"
+                / "part_000"
+                / "translate_tracking.json"
+            )
+            self.assertFalse(part_dir.exists())
+            self.assertEqual(
+                preserved.read_text(encoding="utf-8"),
+                '{"page": []}',
+            )
+
     def test_empty_translation_never_replaces_source(self):
         modules = fake_modules()
         source = paragraph("Mobile robots navigate autonomously.")
@@ -669,6 +869,232 @@ class BabeldocCompatTest(unittest.TestCase):
         self.assertEqual(len(background_units), 1)
         self.assertEqual(background_units[0].render_order, 999_999)
         self.assertEqual(background_units[0].line_width, 0.0)
+
+    def test_native_table_ocr_decision_survives_character_consumption(self):
+        modules = fake_modules()
+        table_layout = SimpleNamespace(
+            class_name="table",
+            box=SimpleNamespace(x=20.0, y=100.0, x2=520.0, y2=400.0),
+        )
+        page = SimpleNamespace(
+            page_number=0,
+            page_layout=[table_layout],
+            pdf_character=[object()],
+            pdf_paragraph=[],
+            pdf_rectangle=[],
+        )
+        document = SimpleNamespace(page=[page])
+        runtime = FakeOcrRuntime(
+            [
+                OcrTextBlock(
+                    text="Duplicate OCR text",
+                    confidence=0.96,
+                    pdf_box=PdfBox(40, 350, 180, 370),
+                    background_rgb=(255, 255, 255),
+                )
+            ]
+        )
+
+        with patch.dict(sys.modules, modules):
+            handle = install_babeldoc_compat(
+                {
+                    "preserve_references": True,
+                    "preserve_toc_layout": True,
+                    "enable_table_ocr": True,
+                },
+                runtime,
+            )
+            shared_config = SimpleNamespace(ocr_workaround=False)
+            layout_parser = FakeLayoutParser()
+            layout_parser.translation_config = shared_config
+            styles = FakeStylesAndFormulas()
+            styles.translation_config = shared_config
+
+            layout_parser.process(document, [object()])
+            page.pdf_character.clear()
+            styles.process(document)
+            handle.restore()
+
+        self.assertEqual(runtime.extract_calls, [])
+        self.assertEqual(page.pdf_paragraph, [])
+        self.assertEqual(shared_config.local_table_stats.ocr_table_regions, 0)
+
+    def test_image_table_ocr_decision_survives_character_population(self):
+        modules = fake_modules()
+        table_layout = SimpleNamespace(
+            class_name="table",
+            box=SimpleNamespace(x=20.0, y=100.0, x2=520.0, y2=400.0),
+        )
+        page = SimpleNamespace(
+            page_number=0,
+            page_layout=[table_layout],
+            pdf_character=[],
+            pdf_paragraph=[],
+            pdf_rectangle=[],
+        )
+        document = SimpleNamespace(page=[page])
+        block = OcrTextBlock(
+            text="Functions",
+            confidence=0.96,
+            pdf_box=PdfBox(360, 350, 500, 370),
+            background_rgb=(78, 143, 132),
+        )
+        runtime = FakeOcrRuntime([block])
+
+        with patch.dict(sys.modules, modules):
+            handle = install_babeldoc_compat(
+                {
+                    "preserve_references": True,
+                    "preserve_toc_layout": True,
+                    "enable_table_ocr": True,
+                },
+                runtime,
+            )
+            shared_config = SimpleNamespace(ocr_workaround=False)
+            layout_parser = FakeLayoutParser()
+            layout_parser.translation_config = shared_config
+            styles = FakeStylesAndFormulas()
+            styles.translation_config = shared_config
+
+            layout_parser.process(document, [object()])
+            page.pdf_character.append(object())
+            styles.process(document)
+            handle.restore()
+
+        self.assertEqual(len(runtime.extract_calls), 1)
+        self.assertEqual(page.pdf_paragraph[-1].unicode, "Functions")
+        self.assertEqual(shared_config.local_table_stats.ocr_table_regions, 1)
+
+    def test_merged_documents_skip_second_font_subset(self):
+        modules = fake_modules()
+        merged_pdf = object()
+        part_pdf = object()
+        translation_config = SimpleNamespace()
+        FakePDFCreater.subset_calls = []
+
+        with patch.dict(sys.modules, modules):
+            handle = install_babeldoc_compat(
+                {
+                    "preserve_references": True,
+                    "preserve_toc_layout": True,
+                    "enable_table_ocr": True,
+                },
+                FakeOcrRuntime([]),
+            )
+            merged_result = FakePDFCreater.subset_fonts_in_subprocess(
+                merged_pdf,
+                translation_config,
+                "merged_dual",
+            )
+            part_result = FakePDFCreater.subset_fonts_in_subprocess(
+                part_pdf,
+                translation_config,
+                "debug",
+            )
+            handle.restore()
+
+        self.assertIs(merged_result, merged_pdf)
+        self.assertEqual(part_result, ("subset", part_pdf))
+        self.assertEqual(
+            FakePDFCreater.subset_calls,
+            [(part_pdf, translation_config, "debug")],
+        )
+
+    def test_ocr_safety_aborts_runtime_before_translation_requests(self):
+        native = [
+            SimpleNamespace(
+                unicode=f"native paragraph {index}",
+                layout_label="text",
+                box=SimpleNamespace(x=0, y=index * 2, x2=100, y2=index * 2 + 1),
+            )
+            for index in range(40)
+        ]
+        ocr = [
+            SimpleNamespace(
+                unicode=f"ocr block {index}",
+                layout_label="babeldoc_table_ocr",
+                debug_id=f"local-table-ocr-0-0-{index}",
+                box=SimpleNamespace(x=200, y=index * 2, x2=300, y2=index * 2 + 1),
+            )
+            for index in range(25)
+        ]
+        document = SimpleNamespace(
+            page=[
+                SimpleNamespace(
+                    page_number=0,
+                    pdf_paragraph=native + ocr,
+                )
+            ]
+        )
+
+        class Runtime:
+            def __init__(self):
+                self.abort_reasons = []
+
+            def abort(self, reason):
+                self.abort_reasons.append(reason)
+
+        runtime = Runtime()
+        translation_config = SimpleNamespace(
+            local_translation_runtime=runtime,
+            local_part_index=2,
+        )
+
+        with self.assertRaises(OcrSafetyError):
+            register_document_origins_and_validate(document, translation_config)
+
+        self.assertEqual(runtime.abort_reasons, ["ocr_anomaly"])
+        self.assertEqual(
+            translation_config.local_ocr_safety_report.document_mode,
+            "born_digital",
+        )
+        self.assertEqual(
+            translation_config.local_ocr_safety_report.reasons,
+            ("ocr_native_ratio",),
+        )
+
+    def test_origin_registry_infers_split_part_index_from_input_filename(self):
+        paragraph = SimpleNamespace(
+            unicode="native paragraph",
+            layout_label="text",
+            box=SimpleNamespace(x=0, y=0, x2=100, y2=10),
+        )
+        document = SimpleNamespace(
+            page=[SimpleNamespace(page_number=0, pdf_paragraph=[paragraph])]
+        )
+        translation_config = SimpleNamespace(
+            local_part_index=0,
+            input_file="/tmp/input.part3.pdf",
+        )
+
+        register_document_origins_and_validate(document, translation_config)
+
+        stable_id = translation_config.local_origin_registry.stable_id(paragraph)
+        self.assertEqual(stable_id, "part-003/page-000/paragraph-000")
+
+    def test_split_parts_share_ocr_snapshots_for_document_summary(self):
+        shared_snapshots = {}
+        for part_index in (0, 1):
+            paragraph = SimpleNamespace(
+                unicode=f"native paragraph {part_index}",
+                layout_label="text",
+                box=SimpleNamespace(x=0, y=0, x2=100, y2=10),
+            )
+            document = SimpleNamespace(
+                page=[SimpleNamespace(page_number=0, pdf_paragraph=[paragraph])]
+            )
+            translation_config = SimpleNamespace(
+                input_file=f"/tmp/input.part{part_index}.pdf",
+                local_ocr_safety_snapshots=shared_snapshots,
+            )
+
+            register_document_origins_and_validate(document, translation_config)
+
+        self.assertEqual(set(shared_snapshots), {0, 1})
+        self.assertEqual(
+            sum(item.native_paragraphs for item in shared_snapshots.values()),
+            2,
+        )
 
 
 if __name__ == "__main__":

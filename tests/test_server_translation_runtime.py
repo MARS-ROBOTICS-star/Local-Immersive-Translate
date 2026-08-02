@@ -61,6 +61,26 @@ def make_job() -> Job:
 
 
 class ServerTranslationRuntimeTest(unittest.TestCase):
+    def test_deepseek_connection_override_keeps_provider_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = deep_merge(
+                DEFAULT_CONFIG,
+                {"babeldoc": {"data_dir": directory}},
+            )
+            state = AppState(config)
+
+            resolved = state._resolve_model_config(
+                "deepseek",
+                {
+                    "baseUrl": "https://api.deepseek.com",
+                    "apiKey": "secret",
+                    "model": "deepseek-v4-flash",
+                },
+            )
+
+        self.assertEqual(resolved["provider"], "deepseek")
+        self.assertEqual(resolved["api_surface"], "openai-chat-completions")
+
     def test_installers_verify_pinned_google_sdk_without_creating_client(self) -> None:
         project_root = Path(__file__).resolve().parents[1]
         bash = (project_root / "scripts" / "install-local-backend.sh").read_text(

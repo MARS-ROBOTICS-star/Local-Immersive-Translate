@@ -2,11 +2,21 @@ from __future__ import annotations
 
 import logging
 import re
+import shutil
 import threading
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from importlib import import_module
+from pathlib import Path
 from typing import Any
 
+from local_babeldoc_server.ocr_safety import OcrRegion
+from local_babeldoc_server.ocr_safety import OcrSafetySnapshot
+from local_babeldoc_server.ocr_safety import OcrSafetyThresholds
+from local_babeldoc_server.ocr_safety import PageTextStats
+from local_babeldoc_server.ocr_safety import ParagraphOriginRegistry
+from local_babeldoc_server.ocr_safety import evaluate_ocr_safety
+from local_babeldoc_server.ocr_safety import is_duplicate_text_region
 from local_babeldoc_server.structure_rules import REFERENCE_LABEL
 from local_babeldoc_server.structure_rules import TOC_LABEL
 from local_babeldoc_server.structure_rules import display_width
@@ -15,6 +25,7 @@ from local_babeldoc_server.structure_rules import parse_toc_entry
 from local_babeldoc_server.structure_rules import rebuild_toc_entry
 from local_babeldoc_server.translation_quality import validate_translation
 from local_babeldoc_server.translation_quality import split_translation_chunks
+from local_babeldoc_server.translation_batching import partition_batch_indices
 
 
 logger = logging.getLogger(__name__)
@@ -24,6 +35,15 @@ PATCH_MARKER = "__local_immersive_translate_compat__"
 TABLE_OCR_LABEL = "babeldoc_table_ocr"
 OCR_BACKGROUND_MARKER_LINE_WIDTH = -1.0
 _STYLE_MARKUP_RE = re.compile(r"</?style\b[^>]*>", re.IGNORECASE)
+_INLINE_PLACEHOLDER_RE = re.compile(r"\{v\d+\}", re.IGNORECASE)
+_URL_LITERAL_RE = re.compile(
+    r"^(?:(?:https?://)|(?:www\.))\S+$",
+    re.IGNORECASE,
+)
+_PARENTHETICAL_CITATION_RE = re.compile(
+    r"^\([^()]{1,160},\s*(?:18|19|20)\d{2}[a-z]?\)[†‡*]?$",
+    re.IGNORECASE,
+)
 
 
 @dataclass(slots=True)
@@ -42,6 +62,197 @@ class TableStats:
     table_regions: int = 0
     ocr_table_regions: int = 0
     ocr_text_blocks: int = 0
+
+
+class OcrSafetyError(RuntimeError):
+    pass
+
+
+class TableLayoutSafetyError(RuntimeError):
+    pass
+
+
+def _is_nontranslatable_literal(text: str) -> bool:
+    normalized = _INLINE_PLACEHOLDER_RE.sub("", text).strip()
+    return bool(
+        _URL_LITERAL_RE.fullmatch(normalized)
+        or _PARENTHETICAL_CITATION_RE.fullmatch(normalized)
+    )
+
+
+_TABLE_OCR_DEBUG_ID_RE = re.compile(
+    r"^local-table-ocr-(?P<page>\d+)-(?P<table>\d+)-(?P<block>\d+)$"
+)
+_SPLIT_PART_FILENAME_RE = re.compile(r"\.part(?P<part>\d+)\.pdf$", re.IGNORECASE)
+
+
+def _part_index(translation_config: Any) -> int:
+    input_file = str(getattr(translation_config, "input_file", "") or "")
+    match = _SPLIT_PART_FILENAME_RE.search(input_file)
+    if match:
+        return int(match.group("part"))
+    return int(getattr(translation_config, "local_part_index", 0) or 0)
+
+
+def _paragraph_bbox(paragraph: Any) -> tuple[float, float, float, float] | None:
+    box = getattr(paragraph, "box", None)
+    if box is None:
+        return None
+    try:
+        return (float(box.x), float(box.y), float(box.x2), float(box.y2))
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
+def register_document_origins_and_validate(
+    document: Any,
+    translation_config: Any,
+):
+    registry = getattr(translation_config, "local_origin_registry", None)
+    if registry is None:
+        registry = ParagraphOriginRegistry()
+        translation_config.local_origin_registry = registry
+    part_index = _part_index(translation_config)
+    native_count = 0
+    table_ocr_count = 0
+    image_ocr_count = 0
+    page_stats = []
+    blocks_per_table: dict[str, int] = {}
+    duplicate_pairs: list[tuple[str, str]] = []
+
+    for page in getattr(document, "page", []):
+        page_number = int(getattr(page, "page_number", 0) or 0)
+        page_native: list[tuple[str, OcrRegion]] = []
+        page_ocr: list[tuple[str, OcrRegion]] = []
+        page_native_count = 0
+        page_ocr_count = 0
+        for paragraph_index, paragraph in enumerate(
+            getattr(page, "pdf_paragraph", [])
+        ):
+            text = str(getattr(paragraph, "unicode", "") or "").strip()
+            if not text:
+                continue
+            bbox = _paragraph_bbox(paragraph)
+            label = getattr(paragraph, "layout_label", None)
+            if label == TABLE_OCR_LABEL:
+                match = _TABLE_OCR_DEBUG_ID_RE.match(
+                    str(getattr(paragraph, "debug_id", "") or "")
+                )
+                table_index = int(match.group("table")) if match else 0
+                block_index = (
+                    int(match.group("block")) if match else page_ocr_count
+                )
+                record = registry.register_table_ocr(
+                    paragraph,
+                    part_index=part_index,
+                    page_number=page_number,
+                    table_index=table_index,
+                    block_index=block_index,
+                    bbox=bbox,
+                    text=text,
+                )
+                table_key = (
+                    f"part-{part_index:03d}/page-{page_number:03d}/"
+                    f"table-{table_index:03d}"
+                )
+                blocks_per_table[table_key] = blocks_per_table.get(table_key, 0) + 1
+                table_ocr_count += 1
+                page_ocr_count += 1
+            elif "ocr" in str(label or "").casefold():
+                record = registry.register_image_ocr(
+                    paragraph,
+                    part_index=part_index,
+                    page_number=page_number,
+                    block_index=page_ocr_count,
+                    bbox=bbox,
+                    text=text,
+                )
+                image_ocr_count += 1
+                page_ocr_count += 1
+            else:
+                record = registry.register_native(
+                    paragraph,
+                    part_index=part_index,
+                    page_number=page_number,
+                    paragraph_index=paragraph_index,
+                    bbox=bbox,
+                    text=text,
+                )
+                native_count += 1
+                page_native_count += 1
+            if bbox is None:
+                continue
+            region = OcrRegion(text=text, bbox=bbox)
+            if record.source_type == "native_text":
+                page_native.append((record.stable_id, region))
+            else:
+                page_ocr.append((record.stable_id, region))
+
+        for native_id, native_region in page_native:
+            for ocr_id, ocr_region in page_ocr:
+                if is_duplicate_text_region(native_region, ocr_region):
+                    duplicate_pairs.append((native_id, ocr_id))
+        page_stats.append(
+            PageTextStats(
+                page_number=page_number,
+                native_paragraphs=page_native_count,
+                ocr_paragraphs=page_ocr_count,
+            )
+        )
+
+    snapshot = OcrSafetySnapshot(
+        page_stats=tuple(page_stats),
+        native_paragraphs=native_count,
+        table_ocr_paragraphs=table_ocr_count,
+        image_ocr_paragraphs=image_ocr_count,
+        ocr_blocks_per_table=blocks_per_table,
+        duplicate_pairs=tuple(duplicate_pairs),
+    )
+    thresholds = OcrSafetyThresholds(
+        max_table_ocr_paragraphs=int(
+            getattr(translation_config, "max_table_ocr_paragraphs", 200)
+        ),
+        max_table_ocr_to_native_ratio=float(
+            getattr(
+                translation_config,
+                "max_table_ocr_to_native_ratio",
+                0.5,
+            )
+        ),
+        max_ocr_blocks_per_table=int(
+            getattr(translation_config, "max_ocr_blocks_per_table", 100)
+        ),
+        ratio_check_min_native_paragraphs=int(
+            getattr(
+                translation_config,
+                "ratio_check_min_native_paragraphs",
+                20,
+            )
+        ),
+    )
+    report = evaluate_ocr_safety(snapshot, thresholds)
+    translation_config.local_ocr_safety_snapshot = snapshot
+    translation_config.local_ocr_safety_report = report
+    shared_snapshots = getattr(
+        translation_config,
+        "local_ocr_safety_snapshots",
+        None,
+    )
+    if shared_snapshots is not None:
+        shared_snapshots[part_index] = snapshot
+    if not report.safe:
+        runtime = getattr(
+            translation_config,
+            "local_translation_runtime",
+            None,
+        )
+        if runtime is not None:
+            runtime.abort("ocr_anomaly")
+        raise OcrSafetyError(
+            "ocr_anomaly: OCR safety check failed: "
+            + ", ".join(report.reasons)
+        )
+    return report
 
 
 def _translation_quality_state(translation_config: Any) -> tuple[dict[str, Any], Any]:
@@ -224,10 +435,31 @@ def _make_ocr_background(il_version: Any, block: Any):
     )
 
 
+def select_table_ocr_regions(
+    document: Any,
+    runtime: Any,
+) -> frozenset[tuple[int, int]]:
+    eligible = set()
+    for page in getattr(document, "page", []):
+        table_layouts = [
+            layout
+            for layout in getattr(page, "page_layout", [])
+            if getattr(layout, "class_name", None) == "table"
+        ]
+        for table_index, layout in enumerate(table_layouts):
+            if runtime.needs_ocr(
+                layout.box,
+                getattr(page, "pdf_character", []),
+            ):
+                eligible.add((page.page_number, table_index))
+    return frozenset(eligible)
+
+
 def inject_ocr_table_paragraphs(
     document: Any,
     mupdf_document: Any,
     runtime: Any,
+    eligible_regions: frozenset[tuple[int, int]] | None = None,
 ) -> TableStats:
     il_version = import_module("babeldoc.format.pdf.document_il.il_version_1")
     table_regions = 0
@@ -242,7 +474,15 @@ def inject_ocr_table_paragraphs(
         ]
         table_regions += len(table_layouts)
         for table_index, layout in enumerate(table_layouts):
-            if not runtime.needs_ocr(layout.box, getattr(page, "pdf_character", [])):
+            region_key = (page.page_number, table_index)
+            if eligible_regions is not None:
+                needs_ocr = region_key in eligible_regions
+            else:
+                needs_ocr = runtime.needs_ocr(
+                    layout.box,
+                    getattr(page, "pdf_character", []),
+                )
+            if not needs_ocr:
                 continue
             blocks = runtime.extract(mupdf_document[page.page_number], layout.box)
             if not blocks:
@@ -279,15 +519,38 @@ def translate_toc_paragraph(
     source_text = getattr(paragraph, "unicode", "") or ""
     _call_tracker(tracker, "set_pdf_unicode", source_text)
     _call_tracker(tracker, "set_input", entry.title)
-    translated_title = translator.translate_engine.translate(
-        entry.title,
-        rate_limit_params={"paragraph_token_count": len(entry.title)},
-    )
+    with _paragraph_translation_context(translator, paragraph, "fallback"):
+        translated_title = translator.translate_engine.translate(
+            entry.title,
+            rate_limit_params={"paragraph_token_count": len(entry.title)},
+        )
     target_columns = max(20, display_width(source_text))
     rebuilt = rebuild_toc_entry(entry, translated_title, target_columns)
     _replace_paragraph_unicode(paragraph, rebuilt)
     _call_tracker(tracker, "set_output", rebuilt)
     return True
+
+
+def _paragraph_translation_context(
+    translator: Any,
+    paragraph: Any,
+    request_category: str,
+):
+    engine = getattr(translator, "translate_engine", None)
+    context_factory = getattr(engine, "paragraph_context", None)
+    if not callable(context_factory):
+        return nullcontext()
+    registry = getattr(
+        getattr(translator, "translation_config", None),
+        "local_origin_registry",
+        None,
+    )
+    stable_id = registry.stable_id(paragraph) if registry is not None else None
+    if stable_id is None:
+        raise OcrSafetyError(
+            "paragraph has no stable provenance before translation"
+        )
+    return context_factory(stable_id, request_category)
 
 
 def install_babeldoc_compat(
@@ -301,23 +564,39 @@ def install_babeldoc_compat(
     translator_module = import_module(
         "babeldoc.format.pdf.document_il.midend.il_translator"
     )
+    translation_config_module = import_module(
+        "babeldoc.format.pdf.translation_config"
+    )
+    typesetting_module = import_module(
+        "babeldoc.format.pdf.document_il.midend.typesetting"
+    )
     paragraph_finder = paragraph_module.ParagraphFinder
     il_translator = translator_module.ILTranslator
+    translation_config_class = translation_config_module.TranslationConfig
+    typesetting_class = typesetting_module.Typesetting
+    llm_only_translator = None
+    try:
+        llm_only_module = import_module(
+            "babeldoc.format.pdf.document_il.midend.il_translator_llm_only"
+        )
+        llm_only_translator = llm_only_module.ILTranslatorLLMOnly
+    except (ImportError, AttributeError):
+        llm_only_translator = None
     table_ocr_enabled = bool(config.get("enable_table_ocr", True) and ocr_runtime)
 
+    pdf_creater_module = import_module(
+        "babeldoc.format.pdf.document_il.backend.pdf_creater"
+    )
+    pdf_creater = pdf_creater_module.PDFCreater
+
     layout_parser = None
-    pdf_creater = None
     rectangle_render_unit = None
     styles_and_formulas = None
     if table_ocr_enabled:
         layout_module = import_module(
             "babeldoc.format.pdf.document_il.midend.layout_parser"
         )
-        pdf_creater_module = import_module(
-            "babeldoc.format.pdf.document_il.backend.pdf_creater"
-        )
         layout_parser = layout_module.LayoutParser
-        pdf_creater = pdf_creater_module.PDFCreater
         rectangle_render_unit = pdf_creater_module.RectangleRenderUnit
         styles_module = import_module(
             "babeldoc.format.pdf.document_il.midend.styles_and_formulas"
@@ -332,14 +611,48 @@ def install_babeldoc_compat(
     original_pre_translate = il_translator.pre_translate_paragraph
     original_translate = il_translator.translate_paragraph
     original_post_translate = il_translator.post_translate_paragraph
+    original_subset_fonts = pdf_creater.subset_fonts_in_subprocess
+    original_subset_fonts_descriptor = pdf_creater.__dict__[
+        "subset_fonts_in_subprocess"
+    ]
+    original_cleanup_part_working_dir = (
+        translation_config_class.cleanup_part_working_dir
+    )
+    original_typesetting_document = typesetting_class.typesetting_document
     handle.originals.extend(
         [
             (paragraph_finder, "process", original_process),
             (il_translator, "pre_translate_paragraph", original_pre_translate),
             (il_translator, "translate_paragraph", original_translate),
             (il_translator, "post_translate_paragraph", original_post_translate),
+            (
+                pdf_creater,
+                "subset_fonts_in_subprocess",
+                original_subset_fonts_descriptor,
+            ),
+            (
+                translation_config_class,
+                "cleanup_part_working_dir",
+                original_cleanup_part_working_dir,
+            ),
+            (
+                typesetting_class,
+                "typesetting_document",
+                original_typesetting_document,
+            ),
         ]
     )
+    original_batch_translate = None
+    original_process_page = None
+    if llm_only_translator is not None:
+        original_batch_translate = llm_only_translator.translate_paragraph
+        original_process_page = llm_only_translator.process_page
+        handle.originals.append(
+            (llm_only_translator, "translate_paragraph", original_batch_translate)
+        )
+        handle.originals.append(
+            (llm_only_translator, "process_page", original_process_page)
+        )
     original_layout_process = None
     original_create_render_units = None
     original_styles_process = None
@@ -364,6 +677,10 @@ def install_babeldoc_compat(
     quality_guard_enabled = bool(
         config.get("enable_translation_quality_guard", True)
     )
+    min_table_translation_scale = float(
+        config.get("min_table_translation_scale", 0.55)
+    )
+    table_bbox_tolerance = float(config.get("table_bbox_tolerance", 0.5))
 
     def wrapped_process(self, document):
         result = original_process(self, document)
@@ -383,15 +700,44 @@ def install_babeldoc_compat(
         page_font_map,
         xobj_font_map,
     ):
+        def record_batch_id(result):
+            if not result or result[0] is None:
+                return result
+            collector = getattr(
+                getattr(self, "translate_engine", None),
+                "collect_batch_stable_id",
+                None,
+            )
+            if callable(collector):
+                registry = getattr(
+                    self.translation_config,
+                    "local_origin_registry",
+                    None,
+                )
+                stable_id = (
+                    registry.stable_id(paragraph)
+                    if registry is not None
+                    else None
+                )
+                if stable_id is None:
+                    raise OcrSafetyError(
+                        "paragraph has no stable provenance before translation"
+                    )
+                collector(stable_id)
+            return result
+
+        source_text = (getattr(paragraph, "unicode", "") or "").strip()
+        if _is_nontranslatable_literal(source_text):
+            _call_tracker(tracker, "set_pdf_unicode", source_text)
+            return None, None
         if preserve_references and getattr(paragraph, "layout_label", None) == REFERENCE_LABEL:
             _call_tracker(
                 tracker,
                 "set_pdf_unicode",
                 getattr(paragraph, "unicode", "") or "",
             )
-            return None, None
+            return record_batch_id((None, None))
         if getattr(paragraph, "layout_label", None) == TABLE_OCR_LABEL:
-            source_text = (getattr(paragraph, "unicode", "") or "").strip()
             if not source_text:
                 return None, None
             _call_tracker(tracker, "set_pdf_unicode", source_text)
@@ -408,14 +754,109 @@ def install_babeldoc_compat(
             )
             if callable(setter):
                 setter({})
-            return source_text, translate_input
-        return original_pre_translate(
-            self,
-            paragraph,
-            tracker,
-            page_font_map,
-            xobj_font_map,
+            return record_batch_id((source_text, translate_input))
+        return record_batch_id(
+            original_pre_translate(
+                self,
+                paragraph,
+                tracker,
+                page_font_map,
+                xobj_font_map,
+            )
         )
+
+    def wrapped_batch_translate(self, *args, **kwargs):
+        context_factory = getattr(
+            getattr(self, "translate_engine", None),
+            "batch_context",
+            None,
+        )
+        if not callable(context_factory):
+            return original_batch_translate(self, *args, **kwargs)
+        with context_factory():
+            return original_batch_translate(self, *args, **kwargs)
+
+    def wrapped_process_page(
+        self,
+        page,
+        executor,
+        pbar=None,
+        tracker=None,
+        executor2=None,
+        translated_ids=None,
+    ):
+        self.translation_config.raise_if_cancelled()
+        if translated_ids is None:
+            translated_ids = set()
+        page_font_map, page_xobj_font_map = self._build_font_maps(page)
+        globals_ = original_process_page.__globals__
+        is_cid = globals_["is_cid_paragraph"]
+        is_numeric = globals_["is_pure_numeric_paragraph"]
+        is_placeholder = globals_["is_placeholder_only_paragraph"]
+        batch_class = globals_["BatchParagraph"]
+        paragraphs = []
+        token_counts = []
+        for paragraph in page.pdf_paragraph:
+            if id(paragraph) in translated_ids:
+                continue
+            if paragraph.debug_id is None or paragraph.unicode is None:
+                continue
+            if (
+                is_cid(paragraph)
+                or len(paragraph.unicode) < self.translation_config.min_text_length
+                or is_numeric(paragraph)
+                or is_placeholder(paragraph)
+            ):
+                if pbar:
+                    pbar.advance(1)
+                continue
+            token_count = self.calc_token_count(paragraph.unicode)
+            paragraphs.append(paragraph)
+            token_counts.append(token_count)
+            translated_ids.add(id(paragraph))
+            if paragraph.layout_label == "title":
+                self.shared_context_cross_split_part.recent_title_paragraph = (
+                    self.shared_context_cross_split_part.snapshot_title_paragraph(
+                        paragraph
+                    )
+                )
+
+        for start, end in partition_batch_indices(
+            token_counts,
+            target_tokens=int(
+                getattr(
+                    self.translation_config,
+                    "batch_target_source_tokens",
+                    1000,
+                )
+            ),
+            max_tokens=int(
+                getattr(
+                    self.translation_config,
+                    "batch_max_source_tokens",
+                    1500,
+                )
+            ),
+            max_paragraphs=int(
+                getattr(self.translation_config, "batch_max_paragraphs", 16)
+            ),
+        ):
+            batch = paragraphs[start:end]
+            total_tokens = sum(token_counts[start:end])
+            self.mid += 1
+            executor.submit(
+                self.translate_paragraph,
+                batch_class(batch, [page] * len(batch), tracker),
+                pbar,
+                page_font_map,
+                page_xobj_font_map,
+                self.translation_config.shared_context_cross_split_part.first_paragraph,
+                self.translation_config.shared_context_cross_split_part.recent_title_paragraph,
+                executor2,
+                priority=1048576 - total_tokens,
+                paragraph_token_count=total_tokens,
+                mp_id=self.mid,
+            )
 
     def wrapped_translate(self, paragraph, *args, **kwargs):
         if preserve_toc_layout and getattr(paragraph, "layout_label", None) == TOC_LABEL:
@@ -424,7 +865,8 @@ def install_babeldoc_compat(
                 tracker = args[2]
             if translate_toc_paragraph(self, paragraph, tracker):
                 return None
-        result = original_translate(self, paragraph, *args, **kwargs)
+        with _paragraph_translation_context(self, paragraph, "fallback"):
+            result = original_translate(self, paragraph, *args, **kwargs)
         tracker = kwargs.get("tracker")
         if tracker is None and len(args) >= 3:
             tracker = args[2]
@@ -457,6 +899,8 @@ def install_babeldoc_compat(
             "translation_retry_chunk_sizes",
             config.get("translation_retry_chunk_sizes", [700, 350]),
         )
+        if getattr(self.translation_config, "local_translation_runtime", None):
+            retry_sizes = ()
         last_reasons = tuple(rejection)
         for chunk_size in retry_sizes:
             chunks = split_translation_chunks(source_text, int(chunk_size))
@@ -615,6 +1059,45 @@ def install_babeldoc_compat(
             target_language,
         )
         if not validation.accepted:
+            translate_engine = getattr(self, "translate_engine", None)
+            batch_context_active = getattr(
+                translate_engine,
+                "is_batch_context_active",
+                lambda: False,
+            )
+            if batch_context_active():
+                with _paragraph_translation_context(
+                    self,
+                    paragraph,
+                    "fallback",
+                ):
+                    fallback_text = translate_engine.translate(
+                        source_text,
+                        ignore_cache=True,
+                        rate_limit_params={
+                            "paragraph_token_count": len(source_text),
+                        },
+                    )
+                fallback_validation = validate_translation(
+                    source_text,
+                    fallback_text,
+                    target_language,
+                )
+                if fallback_validation.accepted:
+                    _record_quality_event(
+                        self.translation_config,
+                        "recovered",
+                        paragraph,
+                        source_text,
+                    )
+                    return original_post_translate(
+                        self,
+                        paragraph,
+                        tracker,
+                        translate_input,
+                        fallback_text,
+                    )
+                validation = fallback_validation
             setattr(tracker, "local_translation_rejection", validation.reasons)
             setattr(tracker, "local_translation_source", source_text)
             setattr(tracker, "local_translate_input", translate_input)
@@ -634,6 +1117,89 @@ def install_babeldoc_compat(
             translated_text,
         )
 
+    def wrapped_subset_fonts(pdf, translation_config, tag):
+        if str(tag).startswith("merged"):
+            logger.info(
+                "Skipping redundant font subsetting for split-result merge: %s",
+                tag,
+            )
+            return pdf
+        return original_subset_fonts(pdf, translation_config, tag)
+
+    def wrapped_cleanup_part_working_dir(self, part_index):
+        part_dir = getattr(self, "_part_working_dirs", {}).get(part_index)
+        working_dir = getattr(self, "working_dir", None)
+        if part_dir is not None and working_dir:
+            part_dir = Path(part_dir)
+            audit_dir = (
+                Path(working_dir)
+                / "translation_tracking_parts"
+                / f"part_{int(part_index):03d}"
+            )
+            for tracking_path in part_dir.rglob("translate_tracking.json"):
+                relative_path = tracking_path.relative_to(part_dir)
+                destination = audit_dir / relative_path
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(tracking_path, destination)
+        return original_cleanup_part_working_dir(self, part_index)
+
+    def wrapped_typesetting_document(self, document):
+        original_boxes: dict[int, tuple[float, float, float, float]] = {}
+        table_locations: dict[int, int] = {}
+        for page in getattr(document, "page", []):
+            page_number = int(getattr(page, "page_number", 0) or 0) + 1
+            for paragraph in getattr(page, "pdf_paragraph", []):
+                label = str(getattr(paragraph, "layout_label", "") or "")
+                if label not in {"table", TABLE_OCR_LABEL}:
+                    continue
+                bbox = _paragraph_bbox(paragraph)
+                if bbox is not None:
+                    original_boxes[id(paragraph)] = bbox
+                    table_locations[id(paragraph)] = page_number
+
+        result = original_typesetting_document(self, document)
+
+        for page in getattr(document, "page", []):
+            for paragraph in getattr(page, "pdf_paragraph", []):
+                paragraph_id = id(paragraph)
+                original_bbox = original_boxes.get(paragraph_id)
+                if original_bbox is None:
+                    continue
+                page_number = table_locations[paragraph_id]
+                scale = float(getattr(paragraph, "scale", 1.0) or 0.0)
+                if scale < min_table_translation_scale:
+                    raise TableLayoutSafetyError(
+                        "table_layout_unsafe: "
+                        f"page={page_number} scale={scale:.3f} "
+                        f"minimum={min_table_translation_scale:.3f}"
+                    )
+                current_bbox = _paragraph_bbox(paragraph)
+                if current_bbox is None:
+                    raise TableLayoutSafetyError(
+                        "table_layout_unsafe: "
+                        f"page={page_number} bbox_missing"
+                    )
+                ox, oy, ox2, oy2 = original_bbox
+                x, y, x2, y2 = current_bbox
+                expanded = (
+                    x < ox - table_bbox_tolerance
+                    or y < oy - table_bbox_tolerance
+                    or x2 > ox2 + table_bbox_tolerance
+                    or y2 > oy2 + table_bbox_tolerance
+                )
+                changed = any(
+                    abs(before - after) > table_bbox_tolerance
+                    for before, after in zip(original_bbox, current_bbox)
+                )
+                if expanded or changed:
+                    reason = "bbox_expanded" if expanded else "bbox_changed"
+                    raise TableLayoutSafetyError(
+                        "table_layout_unsafe: "
+                        f"page={page_number} {reason} "
+                        f"before={original_bbox} after={current_bbox}"
+                    )
+        return result
+
     if table_ocr_enabled:
 
         def wrapped_layout_process(self, document, mupdf_document):
@@ -641,6 +1207,7 @@ def install_babeldoc_compat(
             self.translation_config.local_table_ocr_context = (
                 result,
                 mupdf_document,
+                select_table_ocr_regions(result, ocr_runtime),
             )
             return result
 
@@ -712,6 +1279,7 @@ def install_babeldoc_compat(
                     document,
                     context[1],
                     ocr_runtime,
+                    context[2],
                 )
                 self.translation_config.local_table_stats = table_stats
                 logger.info(
@@ -720,6 +1288,19 @@ def install_babeldoc_compat(
                     table_stats.ocr_table_regions,
                     table_stats.ocr_text_blocks,
                 )
+            ocr_report = register_document_origins_and_validate(
+                document,
+                self.translation_config,
+            )
+            logger.info(
+                "PDF text provenance: mode=%s native=%s table_ocr=%s "
+                "image_ocr=%s duplicates=%s",
+                ocr_report.document_mode,
+                ocr_report.native_paragraphs,
+                ocr_report.table_ocr_paragraphs,
+                ocr_report.image_ocr_paragraphs,
+                ocr_report.duplicate_count,
+            )
             return result
 
         setattr(wrapped_layout_process, PATCH_MARKER, True)
@@ -733,8 +1314,20 @@ def install_babeldoc_compat(
     setattr(wrapped_pre_translate, PATCH_MARKER, True)
     setattr(wrapped_translate, PATCH_MARKER, True)
     setattr(wrapped_post_translate, PATCH_MARKER, True)
+    setattr(wrapped_cleanup_part_working_dir, PATCH_MARKER, True)
+    setattr(wrapped_typesetting_document, PATCH_MARKER, True)
     paragraph_finder.process = wrapped_process
     il_translator.pre_translate_paragraph = wrapped_pre_translate
     il_translator.translate_paragraph = wrapped_translate
     il_translator.post_translate_paragraph = wrapped_post_translate
+    translation_config_class.cleanup_part_working_dir = (
+        wrapped_cleanup_part_working_dir
+    )
+    typesetting_class.typesetting_document = wrapped_typesetting_document
+    if llm_only_translator is not None:
+        setattr(wrapped_batch_translate, PATCH_MARKER, True)
+        setattr(wrapped_process_page, PATCH_MARKER, True)
+        llm_only_translator.translate_paragraph = wrapped_batch_translate
+        llm_only_translator.process_page = wrapped_process_page
+    pdf_creater.subset_fonts_in_subprocess = staticmethod(wrapped_subset_fonts)
     return handle
