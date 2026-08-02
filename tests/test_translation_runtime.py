@@ -357,18 +357,18 @@ class TranslationRuntimeTest(unittest.TestCase):
 
     def test_batch_context_rewrites_stable_request_and_maps_response_to_indices(self) -> None:
         stable_ids = ("part-001/page-003/paragraph-007", "part-001/page-003/paragraph-008")
-        stable_response = AdapterResponse(
+        compact_response = AdapterResponse(
             output_text=(
-                '{"translations":['
-                f'{{"id":"{stable_ids[1]}","translation":"第二段"}},'
-                f'{{"id":"{stable_ids[0]}","translation":"第一段"}}]}}'
+                '{"t":['
+                '{"i":"1","t":"第二段"},'
+                '{"i":"0","t":"第一段"}]}'
             ),
             provider_request_id="provider-batch",
             finish_reason="completed",
             usage=response().usage,
         )
         with tempfile.TemporaryDirectory() as directory:
-            adapter = FakeAdapter([stable_response])
+            adapter = FakeAdapter([compact_response])
             runtime, _budget, _writer = self.make_runtime(directory, adapter)
             translator = RuntimeBackedTranslator(
                 runtime=runtime,
@@ -392,20 +392,18 @@ class TranslationRuntimeTest(unittest.TestCase):
                 '[{"id": 0, "output": "第一段"}, {"id": 1, "output": "第二段"}]',
             )
             sent = adapter.sent_requests[0]
-            self.assertIn(stable_ids[0], sent.input)
+            self.assertNotIn(stable_ids[0], sent.input)
+            self.assertNotIn(stable_ids[1], sent.input)
             self.assertEqual(
-                sent.response_format["schema"]["properties"]["translations"]
-                ["items"]["properties"]["id"]["enum"],
-                list(stable_ids),
+                sent.response_format["schema"]["properties"]["t"]
+                ["items"]["properties"]["i"]["enum"],
+                ["0", "1"],
             )
 
     def test_batch_and_fallback_share_stable_attempt_limit(self) -> None:
         stable_id = "part-000/page-001/paragraph-004"
         batch_response = AdapterResponse(
-            output_text=(
-                '{"translations":['
-                f'{{"id":"{stable_id}","translation":"批量"}}]}}'
-            ),
+            output_text='{"t":[{"i":"0","t":"批量"}]}',
             provider_request_id="provider-batch",
             finish_reason="completed",
             usage=response().usage,
@@ -444,9 +442,9 @@ class TranslationRuntimeTest(unittest.TestCase):
         stable_ids = ("p001", "p002")
         batch_response = AdapterResponse(
             output_text=(
-                '{"translations":['
-                '{"id":"p001","translation":"第一段"},'
-                '{"id":"p002","translation":"第二段"}]}'
+                '{"t":['
+                '{"i":"0","t":"第一段"},'
+                '{"i":"1","t":"第二段"}]}'
             ),
             provider_request_id="provider-batch",
             finish_reason="completed",

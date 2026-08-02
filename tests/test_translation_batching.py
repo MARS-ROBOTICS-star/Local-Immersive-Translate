@@ -11,6 +11,7 @@ from local_babeldoc_server.translation_batching import validate_translation_set
 
 
 EXPECTED = ("part-001/page-003/paragraph-007", "part-001/page-003/paragraph-008")
+ALIASES = ("0", "1")
 
 
 class TranslationBatchingTest(unittest.TestCase):
@@ -30,31 +31,31 @@ class TranslationBatchingTest(unittest.TestCase):
             self.assertLessEqual(end - start, 16)
 
     def test_schema_has_exact_ids_count_and_closed_objects(self) -> None:
-        schema = build_translation_schema(EXPECTED)
+        schema = build_translation_schema(ALIASES)
 
-        translations = schema["properties"]["translations"]
+        translations = schema["properties"]["t"]
         item = translations["items"]
         self.assertEqual(translations["minItems"], 2)
         self.assertEqual(translations["maxItems"], 2)
-        self.assertEqual(item["properties"]["id"]["enum"], list(EXPECTED))
-        self.assertEqual(item["required"], ["id", "translation"])
+        self.assertEqual(item["properties"]["i"]["enum"], list(ALIASES))
+        self.assertEqual(item["required"], ["i", "t"])
         self.assertFalse(item["additionalProperties"])
         self.assertFalse(schema["additionalProperties"])
 
     def test_validation_accepts_out_of_order_complete_ids_and_reorders(self) -> None:
         payload = json.dumps(
             {
-                "translations": [
-                    {"id": EXPECTED[1], "translation": "第二段"},
-                    {"id": EXPECTED[0], "translation": "第一段"},
+                "t": [
+                    {"i": ALIASES[1], "t": "第二段"},
+                    {"i": ALIASES[0], "t": "第一段"},
                 ]
             }
         )
 
-        result = validate_translation_set(payload, EXPECTED)
+        result = validate_translation_set(payload, ALIASES)
 
         self.assertIsNone(result.parse_error)
-        self.assertEqual(list(result.valid_translations), list(EXPECTED))
+        self.assertEqual(list(result.valid_translations), list(ALIASES))
         self.assertEqual(result.missing_ids, ())
         self.assertEqual(result.unknown_ids, ())
         self.assertEqual(result.duplicate_ids, ())
@@ -63,26 +64,26 @@ class TranslationBatchingTest(unittest.TestCase):
         mixed = validate_translation_set(
             json.dumps(
                 {
-                    "translations": [
-                        {"id": EXPECTED[0], "translation": "first-a"},
-                        {"id": EXPECTED[0], "translation": "first-b"},
-                        {"id": "unknown", "translation": "unknown"},
+                    "t": [
+                        {"i": ALIASES[0], "t": "first-a"},
+                        {"i": ALIASES[0], "t": "first-b"},
+                        {"i": "unknown", "t": "unknown"},
                     ]
                 }
             ),
-            EXPECTED,
+            ALIASES,
         )
-        malformed = validate_translation_set("not-json", EXPECTED)
+        malformed = validate_translation_set("not-json", ALIASES)
 
-        self.assertEqual(mixed.missing_ids, (EXPECTED[1],))
+        self.assertEqual(mixed.missing_ids, (ALIASES[1],))
         self.assertEqual(mixed.unknown_ids, ("unknown",))
-        self.assertEqual(mixed.duplicate_ids, (EXPECTED[0],))
+        self.assertEqual(mixed.duplicate_ids, (ALIASES[0],))
         self.assertEqual(mixed.valid_translations, {})
-        self.assertEqual(mixed.fallback_ids, EXPECTED)
+        self.assertEqual(mixed.fallback_ids, ALIASES)
         self.assertIsNotNone(malformed.parse_error)
-        self.assertEqual(malformed.fallback_ids, EXPECTED)
+        self.assertEqual(malformed.fallback_ids, ALIASES)
 
-    def test_prompt_rewrite_uses_stable_ids_and_preserves_preprocessed_text(self) -> None:
+    def test_prompt_rewrite_uses_short_aliases_without_changing_instruction_prefix(self) -> None:
         upstream = (
             "translation rules and glossary\n\n## Here is the input:\n\n"
             + json.dumps(
@@ -94,15 +95,39 @@ class TranslationBatchingTest(unittest.TestCase):
         )
 
         rewritten = rewrite_babeldoc_batch_prompt(upstream, EXPECTED)
-        payload = json.loads(rewritten.prompt.rsplit("STABLE_INPUT_JSON:\n", 1)[1])
-
-        self.assertIn("translation rules and glossary", rewritten.prompt)
-        self.assertEqual(payload["paragraphs"][0]["id"], EXPECTED[0])
-        self.assertEqual(
-            payload["paragraphs"][0]["text"],
-            "<style id='1'>First</style>",
+        self.assertIn("BATCH_INPUT_JSON:\n", rewritten.prompt)
+        payload = json.loads(rewritten.prompt.rsplit("BATCH_INPUT_JSON:\n", 1)[1])
+        serialized_contract = json.dumps(
+            {
+                "prompt": rewritten.prompt,
+                "response_format": rewritten.response_format,
+            },
+            ensure_ascii=False,
         )
-        self.assertEqual(rewritten.source_by_id[EXPECTED[1]], "Second {v1}")
+
+        self.assertEqual(
+            rewritten.instruction_prefix,
+            "translation rules and glossary",
+        )
+        self.assertEqual(
+            payload,
+            {
+                "p": [
+                    {"i": "0", "s": "<style id='1'>First</style>"},
+                    {"i": "1", "s": "Second {v1}"},
+                ]
+            },
+        )
+        self.assertNotIn(EXPECTED[0], serialized_contract)
+        self.assertNotIn(EXPECTED[1], serialized_contract)
+        self.assertEqual(
+            rewritten.stable_id_by_alias,
+            {"0": EXPECTED[0], "1": EXPECTED[1]},
+        )
+        self.assertEqual(
+            rewritten.source_by_stable_id[EXPECTED[1]],
+            "Second {v1}",
+        )
         self.assertEqual(
             rewritten.response_format["mime_type"],
             "application/json",
@@ -111,16 +136,16 @@ class TranslationBatchingTest(unittest.TestCase):
     def test_response_rewrite_keeps_valid_items_and_blanks_only_failed_ids(self) -> None:
         output = json.dumps(
             {
-                "translations": [
-                    {"id": EXPECTED[0], "translation": "第一段"},
-                    {"id": "unknown", "translation": "discard"},
+                "t": [
+                    {"i": ALIASES[0], "t": "第一段"},
+                    {"i": "unknown", "t": "discard"},
                 ]
             }
         )
 
         upstream_json, validation = rewrite_batch_response_for_babeldoc(
             output,
-            EXPECTED,
+            ALIASES,
         )
         upstream = json.loads(upstream_json)
 
@@ -131,8 +156,60 @@ class TranslationBatchingTest(unittest.TestCase):
                 {"id": 1, "output": ""},
             ],
         )
-        self.assertEqual(validation.missing_ids, (EXPECTED[1],))
+        self.assertEqual(validation.missing_ids, (ALIASES[1],))
         self.assertEqual(validation.unknown_ids, ("unknown",))
+
+    def test_compact_protocol_cuts_legacy_overhead_by_half(self) -> None:
+        stable_ids = tuple(
+            f"part-002/page-041/table-000/block-{index:03d}"
+            for index in range(32)
+        )
+        sources = tuple(f"source paragraph {index}" for index in range(32))
+        upstream = (
+            "translation rules and glossary\n\n## Here is the input:\n\n"
+            + json.dumps(
+                [
+                    {"id": index, "input": source}
+                    for index, source in enumerate(sources)
+                ]
+            )
+        )
+        rewritten = rewrite_babeldoc_batch_prompt(upstream, stable_ids)
+        compact_protocol_bytes = len(
+            (
+                rewritten.prompt
+                + json.dumps(rewritten.response_format, ensure_ascii=False)
+            ).encode("utf-8")
+        )
+        legacy_protocol_bytes = len(
+            (
+                json.dumps(
+                    {
+                        "paragraphs": [
+                            {"id": stable_id, "text": source}
+                            for stable_id, source in zip(
+                                stable_ids,
+                                sources,
+                                strict=True,
+                            )
+                        ]
+                    },
+                    ensure_ascii=False,
+                )
+                + json.dumps(
+                    {
+                        "id_enum": list(stable_ids),
+                        "fields": ["id", "translation"],
+                    },
+                    ensure_ascii=False,
+                )
+            ).encode("utf-8")
+        )
+
+        self.assertLessEqual(
+            compact_protocol_bytes,
+            legacy_protocol_bytes * 0.5,
+        )
 
 
 if __name__ == "__main__":

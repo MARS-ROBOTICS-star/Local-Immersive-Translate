@@ -78,9 +78,16 @@ class BatchValidation:
 @dataclass(frozen=True, slots=True)
 class RewrittenBatchPrompt:
     prompt: str
-    expected_ids: tuple[str, ...]
-    source_by_id: Mapping[str, str]
+    instruction_prefix: str
+    expected_stable_ids: tuple[str, ...]
+    stable_id_by_alias: Mapping[str, str]
+    alias_by_stable_id: Mapping[str, str]
+    source_by_stable_id: Mapping[str, str]
     response_format: dict[str, Any]
+
+    @property
+    def expected_ids(self) -> tuple[str, ...]:
+        return tuple(self.stable_id_by_alias)
 
 
 def build_translation_schema(expected_ids: tuple[str, ...]) -> dict[str, Any]:
@@ -88,25 +95,25 @@ def build_translation_schema(expected_ids: tuple[str, ...]) -> dict[str, Any]:
     return {
         "type": "object",
         "properties": {
-            "translations": {
+            "t": {
                 "type": "array",
                 "minItems": count,
                 "maxItems": count,
                 "items": {
                     "type": "object",
                     "properties": {
-                        "id": {
+                        "i": {
                             "type": "string",
                             "enum": list(expected_ids),
                         },
-                        "translation": {"type": "string"},
+                        "t": {"type": "string"},
                     },
-                    "required": ["id", "translation"],
+                    "required": ["i", "t"],
                     "additionalProperties": False,
                 },
             }
         },
-        "required": ["translations"],
+        "required": ["t"],
         "additionalProperties": False,
     }
 
@@ -128,7 +135,7 @@ def validate_translation_set(
             parse_error=str(exc),
         )
     if not isinstance(parsed, dict) or not isinstance(
-        parsed.get("translations"), list
+        parsed.get("t"), list
     ):
         return BatchValidation(
             expected_ids=expected_ids,
@@ -137,15 +144,15 @@ def validate_translation_set(
             unknown_ids=(),
             duplicate_ids=(),
             invalid_ids=(),
-            parse_error="root must contain a translations array",
+            parse_error="root must contain a t array",
         )
 
     expected_set = set(expected_ids)
     rows: list[tuple[str, Any]] = []
-    for item in parsed["translations"]:
-        if not isinstance(item, dict) or "id" not in item:
+    for item in parsed["t"]:
+        if not isinstance(item, dict) or "i" not in item:
             continue
-        rows.append((str(item["id"]), item.get("translation")))
+        rows.append((str(item["i"]), item.get("t")))
     counts = Counter(item_id for item_id, _value in rows)
     returned = set(counts)
     missing_ids = tuple(item for item in expected_ids if item not in returned)
@@ -201,29 +208,39 @@ def rewrite_babeldoc_batch_prompt(
             "stable ID count does not match BabelDOC batch input"
         )
     paragraphs: list[dict[str, str]] = []
-    source_by_id: dict[str, str] = {}
-    for stable_id, item in zip(stable_ids, upstream_input, strict=True):
+    source_by_stable_id: dict[str, str] = {}
+    stable_id_by_alias: dict[str, str] = {}
+    alias_by_stable_id: dict[str, str] = {}
+    for index, (stable_id, item) in enumerate(
+        zip(stable_ids, upstream_input, strict=True)
+    ):
         if not isinstance(item, dict) or not isinstance(item.get("input"), str):
             raise BatchPromptError("BabelDOC batch item has no string input")
         source = item["input"]
-        paragraphs.append({"id": stable_id, "text": source})
-        source_by_id[stable_id] = source
-    stable_payload = {"paragraphs": paragraphs}
+        alias = str(index)
+        paragraphs.append({"i": alias, "s": source})
+        source_by_stable_id[stable_id] = source
+        stable_id_by_alias[alias] = stable_id
+        alias_by_stable_id[stable_id] = alias
+    compact_payload = {"p": paragraphs}
     prefix = prompt[:marker_index].rstrip()
     rewritten_prompt = (
         prefix
-        + "\n\n## Stable structured output override\n"
-        + "Return one JSON object with a translations array. Each item must "
-        + "contain exactly id and translation. Use every stable id exactly once. "
+        + "\n\n## Structured output override\n"
+        + "Return a JSON object with a t array. Each item must contain "
+        + "exactly i and t. Use every short i exactly once. "
         + "This final contract overrides any earlier array example.\n\n"
-        + "STABLE_INPUT_JSON:\n"
-        + json.dumps(stable_payload, ensure_ascii=False)
+        + "BATCH_INPUT_JSON:\n"
+        + json.dumps(compact_payload, ensure_ascii=False, separators=(",", ":"))
     )
-    schema = build_translation_schema(stable_ids)
+    schema = build_translation_schema(tuple(stable_id_by_alias))
     return RewrittenBatchPrompt(
         prompt=rewritten_prompt,
-        expected_ids=stable_ids,
-        source_by_id=source_by_id,
+        instruction_prefix=prefix,
+        expected_stable_ids=stable_ids,
+        stable_id_by_alias=stable_id_by_alias,
+        alias_by_stable_id=alias_by_stable_id,
+        source_by_stable_id=source_by_stable_id,
         response_format={
             "type": "text",
             "mime_type": "application/json",
