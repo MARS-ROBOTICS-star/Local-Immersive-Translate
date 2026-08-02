@@ -14,8 +14,10 @@ from typing import Mapping
 
 from local_babeldoc_server.translation_audit import ApiCallRecord
 from local_babeldoc_server.translation_audit import TranslationAuditWriter
-from local_babeldoc_server.translation_batching import rewrite_batch_response_for_babeldoc
+from local_babeldoc_server.translation_batching import build_recovery_batches
+from local_babeldoc_server.translation_batching import rewritten_batch_response_for_babeldoc
 from local_babeldoc_server.translation_batching import rewrite_babeldoc_batch_prompt
+from local_babeldoc_server.translation_batching import validate_rewritten_batch_response
 from local_babeldoc_server.translation_budget import BudgetExceeded
 from local_babeldoc_server.translation_budget import DocumentBudget
 from local_babeldoc_server.translation_types import AdapterRequest
@@ -312,7 +314,9 @@ class RuntimeBackedTranslator:
     @contextmanager
     def batch_context(self, stable_ids: tuple[str, ...] = ()):
         previous = getattr(self._batch_local, "stable_ids", None)
+        previous_outcomes = getattr(self._batch_local, "item_outcomes", None)
         self._batch_local.stable_ids = list(stable_ids)
+        self._batch_local.item_outcomes = {}
         try:
             yield
         finally:
@@ -321,6 +325,11 @@ class RuntimeBackedTranslator:
                     del self._batch_local.stable_ids
             else:
                 self._batch_local.stable_ids = previous
+            if previous_outcomes is None:
+                if hasattr(self._batch_local, "item_outcomes"):
+                    del self._batch_local.item_outcomes
+            else:
+                self._batch_local.item_outcomes = previous_outcomes
 
     def collect_batch_stable_id(self, stable_id: str) -> None:
         stable_ids = getattr(self._batch_local, "stable_ids", None)
@@ -329,6 +338,12 @@ class RuntimeBackedTranslator:
 
     def is_batch_context_active(self) -> bool:
         return getattr(self._batch_local, "stable_ids", None) is not None
+
+    def batch_item_outcome(self, stable_id: str) -> str | None:
+        outcomes = getattr(self._batch_local, "item_outcomes", None)
+        if outcomes is None:
+            return None
+        return outcomes.get(str(stable_id))
 
     @contextmanager
     def paragraph_context(
@@ -531,6 +546,99 @@ class RuntimeBackedTranslator:
                 extra_headers=params.get("extra_headers") or {},
             ),
         )
+        self._track_usage(response)
+        output_text = response.output_text.strip()
+        if rewritten_batch is not None:
+            validation = validate_rewritten_batch_response(
+                output_text,
+                rewritten_batch,
+                self.lang_out,
+            )
+            translations = dict(validation.valid_translations)
+            recovery_groups = build_recovery_batches(
+                rewritten_batch,
+                validation.recovery_ids,
+                split_full_batch=validation.parse_error is not None,
+            )
+            for recovery_group in recovery_groups:
+                recovery_ids = recovery_group.expected_stable_ids
+                recovery_snapshot = self.runtime.budget.snapshot()
+                recovery_attempt = max(
+                    (
+                        recovery_snapshot.semantic_attempts.get(item, 0)
+                        for item in recovery_ids
+                    ),
+                    default=0,
+                ) + 1
+                recovery_source_tokens = sum(
+                    max(
+                        1,
+                        (
+                            len(
+                                recovery_group.source_by_stable_id[
+                                    stable_id
+                                ].encode("utf-8")
+                            )
+                            + 3
+                        )
+                        // 4,
+                    )
+                    for stable_id in recovery_ids
+                )
+                recovery_response = self.runtime.request(
+                    RequestContext(
+                        document_id=str(params.get("document_id") or "document"),
+                        part_index=params.get("part_index"),
+                        request_category="fallback",
+                        paragraph_ids=recovery_ids,
+                        semantic_attempt_number=recovery_attempt,
+                        transport_attempt_number=1,
+                        source_token_estimate=recovery_source_tokens,
+                        paragraph_count=len(recovery_ids),
+                    ),
+                    AdapterRequest(
+                        model=self.model,
+                        input=recovery_group.prompt,
+                        max_output_tokens=int(
+                            params.get("max_output_tokens") or 4096
+                        ),
+                        response_format=recovery_group.response_format,
+                        reasoning_level="minimal",
+                        extra_headers=params.get("extra_headers") or {},
+                    ),
+                )
+                self._track_usage(recovery_response)
+                recovery_validation = validate_rewritten_batch_response(
+                    recovery_response.output_text.strip(),
+                    recovery_group,
+                    self.lang_out,
+                )
+                translations.update(recovery_validation.valid_translations)
+            unresolved_ids = tuple(
+                stable_id
+                for stable_id in rewritten_batch.expected_stable_ids
+                if stable_id not in translations
+            )
+            outcomes = getattr(self._batch_local, "item_outcomes", None)
+            if outcomes is not None:
+                outcomes.update(
+                    {
+                        stable_id: (
+                            "source_preserved"
+                            if stable_id in unresolved_ids
+                            else "translated"
+                        )
+                        for stable_id in rewritten_batch.expected_stable_ids
+                    }
+                )
+            return rewritten_batch_response_for_babeldoc(
+                rewritten_batch,
+                translations,
+                unresolved_ids,
+            )
+        return output_text
+
+    def _track_usage(self, response: AdapterResponse) -> None:
         usage = response.usage
         self.token_count.inc(usage.total_tokens or 0)
         self.prompt_token_count.inc(usage.prompt_tokens or 0)
@@ -539,13 +647,6 @@ class RuntimeBackedTranslator:
             + (usage.reasoning_tokens or 0)
         )
         self.cache_hit_prompt_token_count.inc(usage.cached_tokens or 0)
-        output_text = response.output_text.strip()
-        if rewritten_batch is not None:
-            output_text, _validation = rewrite_batch_response_for_babeldoc(
-                output_text,
-                rewritten_batch.expected_ids,
-            )
-        return output_text
 
     def _simple_prompt(self, text: str) -> str:
         return (

@@ -51,20 +51,23 @@ class TranslationRuntimeRegressionTest(unittest.TestCase):
             expected_ids = tuple(
                 item["id"] for item in paragraphs[start:end]
             )
+            expected_aliases = tuple(
+                str(index) for index in range(len(expected_ids))
+            )
             fake_output = json.dumps(
                 {
-                    "translations": [
-                        {"id": stable_id, "translation": f"translated-{index}"}
-                        for index, stable_id in enumerate(expected_ids)
+                    "t": [
+                        {"i": alias, "t": f"translated-{index}"}
+                        for index, alias in enumerate(expected_aliases)
                     ]
                 }
             )
-            validation = validate_translation_set(fake_output, expected_ids)
+            validation = validate_translation_set(fake_output, expected_aliases)
             self.assertEqual(validation.fallback_ids, ())
             exposures.update(expected_ids)
 
         self.assertLessEqual(len(batches), profile["max_requests"])
-        self.assertTrue(all(end - start <= 16 for start, end in batches))
+        self.assertTrue(all(end - start <= 40 for start, end in batches))
         self.assertTrue(all(value <= 2 for value in exposures.values()))
 
     def test_borges_profile_table_ocr_anomaly_blocks_before_any_send(self) -> None:

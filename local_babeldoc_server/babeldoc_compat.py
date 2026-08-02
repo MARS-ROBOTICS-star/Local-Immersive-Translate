@@ -279,12 +279,15 @@ def _record_quality_event(
     paragraph: Any,
     source_text: str,
     reasons: tuple[str, ...] = (),
+    *,
+    source_preserved: bool = False,
 ) -> None:
     state, lock = _translation_quality_state(translation_config)
     record = {
         "paragraph_id": getattr(paragraph, "debug_id", None),
         "source_preview": source_text[:240],
         "reasons": list(reasons),
+        "source_preserved": bool(source_preserved),
     }
     with lock:
         if kind == "rejected":
@@ -1048,6 +1051,37 @@ def install_babeldoc_compat(
                 translated_text,
             )
         source_text = getattr(translate_input, "unicode", "") or ""
+        translate_engine = getattr(self, "translate_engine", None)
+        outcome_getter = getattr(
+            translate_engine,
+            "batch_item_outcome",
+            None,
+        )
+        registry = getattr(
+            getattr(self, "translation_config", None),
+            "local_origin_registry",
+            None,
+        )
+        stable_id = (
+            registry.stable_id(paragraph)
+            if registry is not None
+            else None
+        )
+        if (
+            stable_id is not None
+            and callable(outcome_getter)
+            and outcome_getter(stable_id) == "source_preserved"
+        ):
+            _call_tracker(tracker, "set_output", source_text)
+            _record_quality_event(
+                self.translation_config,
+                "unresolved",
+                paragraph,
+                source_text,
+                ("source_preserved_after_two_attempts",),
+                source_preserved=True,
+            )
+            return False
         target_language = getattr(
             getattr(self, "translation_config", None),
             "lang_out",
@@ -1059,7 +1093,6 @@ def install_babeldoc_compat(
             target_language,
         )
         if not validation.accepted:
-            translate_engine = getattr(self, "translate_engine", None)
             batch_context_active = getattr(
                 translate_engine,
                 "is_batch_context_active",

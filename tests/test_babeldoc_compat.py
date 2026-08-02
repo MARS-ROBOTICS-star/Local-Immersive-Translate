@@ -11,6 +11,7 @@ from local_babeldoc_server.babeldoc_compat import inject_ocr_table_paragraphs
 from local_babeldoc_server.babeldoc_compat import OcrSafetyError
 from local_babeldoc_server.babeldoc_compat import register_document_origins_and_validate
 from local_babeldoc_server.babeldoc_compat import translate_toc_paragraph
+from local_babeldoc_server.ocr_safety import ParagraphOriginRegistry
 from local_babeldoc_server.structure_rules import REFERENCE_LABEL
 from local_babeldoc_server.structure_rules import TOC_LABEL
 from local_babeldoc_server.table_ocr import OcrTextBlock
@@ -270,6 +271,7 @@ class FakeQueuedLLMEngine:
         require_cache_bypass=False,
         simple_outputs=None,
         batch_active=False,
+        batch_outcomes=None,
     ):
         self.outputs = list(outputs)
         self.inputs = []
@@ -277,9 +279,13 @@ class FakeQueuedLLMEngine:
         self.simple_outputs = list(simple_outputs or [])
         self.simple_inputs = []
         self.batch_active = batch_active
+        self.batch_outcomes = dict(batch_outcomes or {})
 
     def is_batch_context_active(self):
         return self.batch_active
+
+    def batch_item_outcome(self, stable_id):
+        return self.batch_outcomes.get(stable_id)
 
     def llm_translate(self, text, ignore_cache=False, rate_limit_params=None):
         self.inputs.append(text)
@@ -306,6 +312,56 @@ class FakeOcrRuntime:
 
 
 class BabeldocCompatTest(unittest.TestCase):
+    def test_source_preserved_batch_item_does_not_trigger_third_request(self):
+        modules = fake_modules()
+        source = paragraph(
+            "This substantial English source paragraph remains intact after "
+            "two invalid provider responses."
+        )
+        stable_id = "part-000/page-001/paragraph-000"
+        tracker = FakeTracker()
+        translator = FakeILTranslator()
+        translator.translate_engine = FakeQueuedLLMEngine(
+            [],
+            simple_outputs=["不应发送"],
+            batch_active=True,
+            batch_outcomes={stable_id: "source_preserved"},
+        )
+        registry = ParagraphOriginRegistry()
+        registry.register_native(
+            source,
+            part_index=0,
+            page_number=1,
+            paragraph_index=0,
+            bbox=(40.0, 100.0, 520.0, 112.0),
+            text=source.unicode,
+        )
+        translator.translation_config.local_origin_registry = registry
+        translate_input = translator.TranslateInput(
+            source.unicode,
+            [],
+            source.pdf_style,
+        )
+
+        with patch.dict(sys.modules, modules):
+            handle = install_babeldoc_compat(
+                {"preserve_references": True, "preserve_toc_layout": True}
+            )
+            result = translator.post_translate_paragraph(
+                source,
+                tracker,
+                translate_input,
+                source.unicode,
+            )
+            handle.restore()
+
+        self.assertFalse(result)
+        self.assertEqual(translator.translate_engine.simple_inputs, [])
+        self.assertEqual(tracker.output, source.unicode)
+        quality = translator.translation_config.local_translation_quality
+        self.assertEqual(quality["unresolved_count"], 1)
+        self.assertTrue(quality["unresolved"][0]["source_preserved"])
+
     def test_batch_quality_rejection_uses_one_validated_fallback(self):
         modules = fake_modules()
         source = paragraph("Total 120 000 K images (10 K instance")

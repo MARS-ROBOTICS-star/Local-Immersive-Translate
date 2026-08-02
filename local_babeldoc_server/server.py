@@ -1055,8 +1055,9 @@ class AppState:
             remove_non_formula_lines=bool(
                 babeldoc_cfg.get("remove_non_formula_lines", False)
             ),
-            disable_same_text_fallback=bool(
-                babeldoc_cfg.get("disable_same_text_fallback", False)
+            disable_same_text_fallback=(
+                bool(babeldoc_cfg.get("enable_translation_quality_guard", True))
+                or bool(babeldoc_cfg.get("disable_same_text_fallback", False))
             ),
             metadata_extra_data=f"local_zotero_{pdf_id}",
         )

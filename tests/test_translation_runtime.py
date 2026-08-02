@@ -400,6 +400,139 @@ class TranslationRuntimeTest(unittest.TestCase):
                 ["0", "1"],
             )
 
+    def test_three_failed_items_use_one_grouped_recovery_request(self) -> None:
+        stable_ids = ("p000", "p001", "p002", "p003")
+        initial = response('{"t":[{"i":"0","t":"甲"}]}')
+        recovery = response(
+            '{"t":['
+            '{"i":"0","t":"乙"},'
+            '{"i":"1","t":"丙"},'
+            '{"i":"2","t":"丁"}]}'
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            adapter = FakeAdapter([initial, recovery])
+            runtime, budget, _writer = self.make_runtime(directory, adapter)
+            translator = RuntimeBackedTranslator(
+                runtime=runtime,
+                lang_in="en",
+                lang_out="zh",
+                model="fake-model",
+            )
+            upstream_prompt = (
+                "rules\n\n## Here is the input:\n\n"
+                '[{"id":0,"input":"First"},'
+                '{"id":1,"input":"Second"},'
+                '{"id":2,"input":"Third"},'
+                '{"id":3,"input":"Fourth"}]'
+            )
+
+            with translator.batch_context(stable_ids):
+                translated = translator.llm_translate(
+                    upstream_prompt,
+                    rate_limit_params={
+                        "request_json_mode": True,
+                        "paragraph_token_count": 80,
+                    },
+                )
+
+            self.assertEqual(adapter.send_count, 2)
+            self.assertEqual(
+                json.loads(translated),
+                [
+                    {"id": 0, "output": "甲"},
+                    {"id": 1, "output": "乙"},
+                    {"id": 2, "output": "丙"},
+                    {"id": 3, "output": "丁"},
+                ],
+            )
+            self.assertEqual(
+                budget.snapshot().semantic_attempts,
+                {"p000": 1, "p001": 2, "p002": 2, "p003": 2},
+            )
+
+    def test_malformed_full_batch_is_bisected_for_second_attempt(self) -> None:
+        stable_ids = ("p000", "p001", "p002", "p003")
+        with tempfile.TemporaryDirectory() as directory:
+            adapter = FakeAdapter(
+                [
+                    response("not-json"),
+                    response(
+                        '{"t":['
+                        '{"i":"0","t":"甲"},'
+                        '{"i":"1","t":"乙"}]}'
+                    ),
+                    response(
+                        '{"t":['
+                        '{"i":"0","t":"丙"},'
+                        '{"i":"1","t":"丁"}]}'
+                    ),
+                ]
+            )
+            runtime, _budget, _writer = self.make_runtime(directory, adapter)
+            translator = RuntimeBackedTranslator(
+                runtime=runtime,
+                lang_in="en",
+                lang_out="zh",
+                model="fake-model",
+            )
+            upstream_prompt = (
+                "rules\n\n## Here is the input:\n\n"
+                '[{"id":0,"input":"First"},'
+                '{"id":1,"input":"Second"},'
+                '{"id":2,"input":"Third"},'
+                '{"id":3,"input":"Fourth"}]'
+            )
+
+            with translator.batch_context(stable_ids):
+                translated = translator.llm_translate(
+                    upstream_prompt,
+                    rate_limit_params={"request_json_mode": True},
+                )
+
+            self.assertEqual(adapter.send_count, 3)
+            self.assertEqual(
+                [len(json.loads(item.input.rsplit("BATCH_INPUT_JSON:\n", 1)[1])["p"])
+                 for item in adapter.sent_requests[1:]],
+                [2, 2],
+            )
+            self.assertEqual(
+                [item["output"] for item in json.loads(translated)],
+                ["甲", "乙", "丙", "丁"],
+            )
+
+    def test_protected_token_rejection_is_recovered_before_babeldoc_mutation(self) -> None:
+        stable_id = "p-numeric"
+        source_text = "Total 120 000 K images (10 K instances)."
+        initial = response('{"t":[{"i":"0","t":"共计12万张图像（1万实例）。"}]}')
+        recovery = response(
+            '{"t":[{"i":"0","t":"共计 120 000 K 张图像（10 K 个实例）。"}]}'
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            adapter = FakeAdapter([initial, recovery])
+            runtime, _budget, _writer = self.make_runtime(directory, adapter)
+            translator = RuntimeBackedTranslator(
+                runtime=runtime,
+                lang_in="en",
+                lang_out="zh",
+                model="fake-model",
+            )
+            upstream_prompt = (
+                "rules\n\n## Here is the input:\n\n"
+                + json.dumps([{"id": 0, "input": source_text}])
+            )
+
+            with translator.batch_context((stable_id,)):
+                translated = translator.llm_translate(
+                    upstream_prompt,
+                    rate_limit_params={"request_json_mode": True},
+                )
+
+            self.assertEqual(adapter.send_count, 2)
+            self.assertEqual(
+                json.loads(translated)[0]["output"],
+                "共计 120 000 K 张图像（10 K 个实例）。",
+            )
+
     def test_batch_and_fallback_share_stable_attempt_limit(self) -> None:
         stable_id = "part-000/page-001/paragraph-004"
         batch_response = AdapterResponse(
