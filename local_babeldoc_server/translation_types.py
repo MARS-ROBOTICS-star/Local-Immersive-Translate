@@ -144,6 +144,10 @@ class RequestContext:
     transport_attempt_number: int
     source_token_estimate: int
     paragraph_count: int
+    request_phase: str = "initial"
+    source_text_bytes: int = 0
+    batch_fill_ratio: float = 0.0
+    recovery_reason_counts: Mapping[str, int] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)

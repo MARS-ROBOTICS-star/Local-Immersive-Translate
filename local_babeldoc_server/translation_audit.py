@@ -5,6 +5,7 @@ import os
 import shutil
 import threading
 from dataclasses import dataclass
+from dataclasses import field
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -42,6 +43,14 @@ class ApiCallRecord:
     finished_at: str
     error_code: str | None = None
     text_hashes: tuple[str, ...] = ()
+    request_phase: str = "initial"
+    serialized_input_bytes: int = 0
+    schema_bytes: int = 0
+    source_text_bytes: int = 0
+    protocol_overhead_bytes: int = 0
+    batch_fill_ratio: float = 0.0
+    recovery_reason_counts: Mapping[str, int] = field(default_factory=dict)
+    remote_token_count_request: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -65,6 +74,14 @@ class ApiCallRecord:
             "finished_at": self.finished_at,
             "error_code": self.error_code,
             "text_hashes": list(self.text_hashes),
+            "request_phase": self.request_phase,
+            "serialized_input_bytes": self.serialized_input_bytes,
+            "schema_bytes": self.schema_bytes,
+            "source_text_bytes": self.source_text_bytes,
+            "protocol_overhead_bytes": self.protocol_overhead_bytes,
+            "batch_fill_ratio": self.batch_fill_ratio,
+            "recovery_reason_counts": dict(self.recovery_reason_counts),
+            "remote_token_count_request": self.remote_token_count_request,
         }
 
 
@@ -78,6 +95,9 @@ class UsageSummary:
     fallback_request_count: int = 0
     quality_retry_count: int = 0
     terminology_request_count: int = 0
+    initial_batch_request_count: int = 0
+    recovery_batch_request_count: int = 0
+    protocol_overhead_bytes: int = 0
     prompt_tokens: int = 0
     visible_completion_tokens: int = 0
     reasoning_tokens: int | None = 0
@@ -106,6 +126,9 @@ class UsageSummary:
             "fallback_request_count": self.fallback_request_count,
             "quality_retry_count": self.quality_retry_count,
             "terminology_request_count": self.terminology_request_count,
+            "initial_batch_request_count": self.initial_batch_request_count,
+            "recovery_batch_request_count": self.recovery_batch_request_count,
+            "protocol_overhead_bytes": self.protocol_overhead_bytes,
             "prompt_tokens": self.prompt_tokens,
             "visible_completion_tokens": self.visible_completion_tokens,
             "reasoning_tokens": self.reasoning_tokens,
@@ -166,9 +189,20 @@ def replay_api_calls(
     actual_cost = Decimal("0")
     billable_count = 0
     unknown_count = 0
+    initial_batch_count = 0
+    recovery_batch_count = 0
+    protocol_overhead_bytes = 0
     for row in rows:
         category = str(row.get("request_category") or "")
         categories[category] = categories.get(category, 0) + 1
+        request_phase = str(row.get("request_phase") or "initial")
+        if category == "batch" and request_phase == "initial":
+            initial_batch_count += 1
+        if request_phase == "recovery":
+            recovery_batch_count += 1
+        protocol_overhead_bytes += int(
+            row.get("protocol_overhead_bytes") or 0
+        )
         status = row.get("billing_status")
         is_billable = status in {
             BillingStatus.CONFIRMED.value,
@@ -211,6 +245,9 @@ def replay_api_calls(
         fallback_request_count=categories.get("fallback", 0),
         quality_retry_count=categories.get("quality_retry", 0),
         terminology_request_count=categories.get("terminology", 0),
+        initial_batch_request_count=initial_batch_count,
+        recovery_batch_request_count=recovery_batch_count,
+        protocol_overhead_bytes=protocol_overhead_bytes,
         prompt_tokens=prompt_tokens,
         visible_completion_tokens=visible_completion_tokens,
         reasoning_tokens=(

@@ -31,6 +31,15 @@ class RecordingInteractions:
         return self.response
 
 
+class ExplodingTokenCounter:
+    def __init__(self):
+        self.calls = 0
+
+    def count_tokens(self, **_kwargs):
+        self.calls += 1
+        raise AssertionError("remote countTokens request was sent")
+
+
 class RecordingChatCompletions:
     def __init__(self, response):
         self.response = response
@@ -76,6 +85,27 @@ MINIMAL_CAPABILITIES = ProviderCapabilities(
 
 
 class TranslatorAdaptersTest(unittest.TestCase):
+    def test_gemini_count_tokens_is_local_and_includes_schema(self) -> None:
+        models = ExplodingTokenCounter()
+        adapter = GeminiInteractionsAdapter(
+            api_key="secret",
+            model="gemini-3.1-flash-lite",
+            client=SimpleNamespace(models=models),
+        )
+        request = AdapterRequest(
+            model=adapter.model,
+            input="abc",
+            response_format={
+                "type": "text",
+                "schema": {"type": "object"},
+            },
+        )
+
+        bound = adapter.count_tokens(request)
+
+        self.assertGreater(bound, len("abc"))
+        self.assertEqual(models.calls, 0)
+
     def test_missing_google_sdk_reports_backend_reinstall_action(self) -> None:
         original_import = builtins.__import__
 

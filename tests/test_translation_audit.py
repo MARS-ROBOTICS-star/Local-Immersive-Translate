@@ -71,6 +71,25 @@ def api_record(
 
 
 class TranslationAuditTest(unittest.TestCase):
+    def test_call_record_exposes_protocol_metrics_without_prompt_text(self) -> None:
+        serialized = api_record(
+            request_id="req-metrics",
+            category="batch",
+            billing_status=BillingStatus.CONFIRMED,
+            outcome=TransportOutcome.COMPLETED,
+            usage=NormalizedUsage(total_tokens=1),
+            settled_cost="0",
+        ).to_dict()
+
+        self.assertEqual(serialized.get("request_phase"), "initial")
+        self.assertEqual(serialized.get("serialized_input_bytes"), 0)
+        self.assertEqual(serialized.get("schema_bytes"), 0)
+        self.assertEqual(serialized.get("source_text_bytes"), 0)
+        self.assertEqual(serialized.get("protocol_overhead_bytes"), 0)
+        self.assertEqual(serialized.get("batch_fill_ratio"), 0.0)
+        self.assertEqual(serialized.get("recovery_reason_counts"), {})
+        self.assertIs(serialized.get("remote_token_count_request"), False)
+
     def test_records_are_jsonl_safe_and_summary_distinguishes_call_sources(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             writer = TranslationAuditWriter(Path(directory), PRICING)

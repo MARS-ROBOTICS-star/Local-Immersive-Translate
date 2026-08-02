@@ -126,7 +126,7 @@ GEMINI_INTERACTIONS_CAPABILITIES = ProviderCapabilities(
     ),
     exposes_reasoning_usage=True,
     supports_cached_usage=True,
-    supports_count_tokens=True,
+    supports_count_tokens=False,
     supports_request_id=True,
 )
 
@@ -162,15 +162,7 @@ class GeminiInteractionsAdapter:
         )
 
     def count_tokens(self, request: AdapterRequest) -> int:
-        models = getattr(self.client, "models", None)
-        counter = getattr(models, "count_tokens", None)
-        if not callable(counter):
-            return _conservative_local_token_bound(request)
-        result = counter(model=self.model, contents=request.input)
-        counted = _value(result, "total_tokens")
-        if counted is None:
-            return _conservative_local_token_bound(request)
-        return int(counted)
+        return _conservative_local_token_bound(request)
 
     def validate_request(self, request: AdapterRequest) -> None:
         level = request.reasoning_level or "minimal"

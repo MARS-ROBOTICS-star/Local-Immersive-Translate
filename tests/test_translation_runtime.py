@@ -240,7 +240,7 @@ class TranslationRuntimeTest(unittest.TestCase):
     def test_aborted_runtime_refuses_adapter_send(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             adapter = FakeAdapter([response()])
-            runtime, budget, _writer = self.make_runtime(directory, adapter)
+            runtime, budget, writer = self.make_runtime(directory, adapter)
             runtime.abort("ocr_anomaly")
 
             with self.assertRaises(BudgetExceeded):
@@ -255,7 +255,7 @@ class TranslationRuntimeTest(unittest.TestCase):
     def test_runtime_backed_translator_routes_simple_and_batch_calls(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             adapter = FakeAdapter([response("单段"), response("批量")])
-            runtime, budget, _writer = self.make_runtime(directory, adapter)
+            runtime, budget, writer = self.make_runtime(directory, adapter)
             translator = RuntimeBackedTranslator(
                 runtime=runtime,
                 lang_in="en",
@@ -411,7 +411,7 @@ class TranslationRuntimeTest(unittest.TestCase):
         )
         with tempfile.TemporaryDirectory() as directory:
             adapter = FakeAdapter([initial, recovery])
-            runtime, budget, _writer = self.make_runtime(directory, adapter)
+            runtime, budget, writer = self.make_runtime(directory, adapter)
             translator = RuntimeBackedTranslator(
                 runtime=runtime,
                 lang_in="en",
@@ -449,6 +449,26 @@ class TranslationRuntimeTest(unittest.TestCase):
                 budget.snapshot().semantic_attempts,
                 {"p000": 1, "p001": 2, "p002": 2, "p003": 2},
             )
+            rows = [
+                json.loads(line)
+                for line in writer.jsonl_path.read_text(
+                    encoding="utf-8"
+                ).splitlines()
+            ]
+            self.assertEqual(rows[0]["request_phase"], "initial")
+            self.assertGreater(rows[0]["serialized_input_bytes"], 0)
+            self.assertGreater(rows[0]["schema_bytes"], 0)
+            self.assertEqual(rows[0]["source_text_bytes"], 22)
+            self.assertGreater(rows[0]["protocol_overhead_bytes"], 0)
+            self.assertEqual(rows[1]["request_phase"], "recovery")
+            self.assertEqual(
+                rows[1]["recovery_reason_counts"],
+                {"missing_id": 3},
+            )
+            summary = writer.checkpoint()
+            self.assertEqual(summary.initial_batch_request_count, 1)
+            self.assertEqual(summary.recovery_batch_request_count, 1)
+            self.assertGreater(summary.protocol_overhead_bytes, 0)
 
     def test_malformed_full_batch_is_bisected_for_second_attempt(self) -> None:
         stable_ids = ("p000", "p001", "p002", "p003")

@@ -4,6 +4,7 @@ import hashlib
 import json
 import threading
 import uuid
+from collections import Counter
 from contextlib import contextmanager
 from dataclasses import replace
 from datetime import datetime
@@ -43,6 +44,20 @@ def _text_hashes(request: AdapterRequest) -> tuple[str, ...]:
         default=str,
     ).encode("utf-8")
     return (f"sha256-{hashlib.sha256(serialized).hexdigest()[:16]}",)
+
+
+def _serialized_bytes(value: Any) -> int:
+    if isinstance(value, str):
+        return len(value.encode("utf-8"))
+    return len(
+        json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            default=str,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    )
 
 
 class TranslationRuntime:
@@ -228,6 +243,18 @@ class TranslationRuntime:
         request: AdapterRequest,
         started_at: str,
     ) -> None:
+        serialized_input_bytes = _serialized_bytes(request.input)
+        schema_bytes = (
+            _serialized_bytes(request.response_format)
+            if request.response_format is not None
+            else 0
+        )
+        protocol_overhead_bytes = max(
+            0,
+            serialized_input_bytes
+            + schema_bytes
+            - context.source_text_bytes,
+        )
         self.audit_writer.record(
             ApiCallRecord(
                 request_id=request_id,
@@ -250,6 +277,14 @@ class TranslationRuntime:
                 finished_at=_utc_now(),
                 error_code=error_code,
                 text_hashes=_text_hashes(request),
+                request_phase=context.request_phase,
+                serialized_input_bytes=serialized_input_bytes,
+                schema_bytes=schema_bytes,
+                source_text_bytes=context.source_text_bytes,
+                protocol_overhead_bytes=protocol_overhead_bytes,
+                batch_fill_ratio=context.batch_fill_ratio,
+                recovery_reason_counts=context.recovery_reason_counts,
+                remote_token_count_request=False,
             )
         )
         self._checkpoint()
@@ -519,6 +554,25 @@ class RuntimeBackedTranslator:
             (snapshot.semantic_attempts.get(item, 0) for item in stable_ids),
             default=0,
         ) + 1
+        source_token_estimate = int(
+            params.get("paragraph_token_count") or len(text)
+        )
+        source_text_bytes = (
+            sum(
+                len(source.encode("utf-8"))
+                for source in rewritten_batch.source_by_stable_id.values()
+            )
+            if rewritten_batch is not None
+            else len(text.encode("utf-8"))
+        )
+        request_phase = str(
+            params.get("request_phase")
+            or (
+                "recovery"
+                if category in {"fallback", "quality_retry"}
+                else "initial"
+            )
+        )
         context = RequestContext(
             document_id=str(params.get("document_id") or "document"),
             part_index=params.get("part_index"),
@@ -526,10 +580,15 @@ class RuntimeBackedTranslator:
             paragraph_ids=stable_ids,
             semantic_attempt_number=next_semantic,
             transport_attempt_number=1,
-            source_token_estimate=int(
-                params.get("paragraph_token_count") or len(text)
-            ),
+            source_token_estimate=source_token_estimate,
             paragraph_count=len(stable_ids),
+            request_phase=request_phase,
+            source_text_bytes=source_text_bytes,
+            batch_fill_ratio=(
+                min(1.0, source_token_estimate / 2400.0)
+                if rewritten_batch is not None
+                else 0.0
+            ),
         )
         response = self.runtime.request(
             context,
@@ -595,6 +654,29 @@ class RuntimeBackedTranslator:
                         transport_attempt_number=1,
                         source_token_estimate=recovery_source_tokens,
                         paragraph_count=len(recovery_ids),
+                        request_phase="recovery",
+                        source_text_bytes=sum(
+                            len(
+                                recovery_group.source_by_stable_id[
+                                    stable_id
+                                ].encode("utf-8")
+                            )
+                            for stable_id in recovery_ids
+                        ),
+                        batch_fill_ratio=min(
+                            1.0,
+                            recovery_source_tokens / 2400.0,
+                        ),
+                        recovery_reason_counts=dict(
+                            Counter(
+                                reason
+                                for stable_id in recovery_ids
+                                for reason in validation.reason_by_stable_id.get(
+                                    stable_id,
+                                    (),
+                                )
+                            )
+                        ),
                     ),
                     AdapterRequest(
                         model=self.model,
