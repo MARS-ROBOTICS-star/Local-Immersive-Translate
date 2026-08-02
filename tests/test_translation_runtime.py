@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from decimal import Decimal
@@ -8,6 +9,7 @@ from pathlib import Path
 from local_babeldoc_server.translation_audit import TranslationAuditWriter
 from local_babeldoc_server.translation_budget import BudgetExceeded
 from local_babeldoc_server.translation_budget import DocumentBudget
+from local_babeldoc_server.translation_budget import AttemptLimitExceeded
 from local_babeldoc_server.translation_runtime import RuntimeBackedTranslator
 from local_babeldoc_server.translation_runtime import TranslationRuntime
 from local_babeldoc_server.translation_types import AdapterRequest
@@ -228,6 +230,10 @@ class TranslationRuntimeTest(unittest.TestCase):
                 )
 
             self.assertEqual(budget.snapshot().request_count, 0)
+            self.assertEqual(
+                budget.snapshot().abort_reason,
+                "model_configuration_error",
+            )
             self.assertEqual(adapter.send_count, 0)
             self.assertFalse(writer.jsonl_path.exists())
 
@@ -277,6 +283,35 @@ class TranslationRuntimeTest(unittest.TestCase):
             self.assertEqual(translator.translate_call_count, 2)
             self.assertEqual(translator.token_count.value, 250)
 
+    def test_terminology_translator_uses_its_own_category_without_paragraph_attempts(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            adapter = FakeAdapter([response('{"terms": []}')])
+            runtime, budget, writer = self.make_runtime(directory, adapter)
+            translator = RuntimeBackedTranslator(
+                runtime=runtime,
+                lang_in="en",
+                lang_out="zh",
+                model="fake-model",
+                default_llm_request_category="terminology",
+            )
+
+            translator.llm_translate(
+                "extract terminology",
+                rate_limit_params={"request_json_mode": True},
+            )
+
+            snapshot = budget.snapshot()
+            self.assertEqual(snapshot.semantic_attempts, {})
+            self.assertEqual(snapshot.billable_exposures, {})
+            record = json.loads(
+                writer.jsonl_path.read_text(encoding="utf-8").splitlines()[0]
+            )
+            self.assertEqual(record["request_category"], "terminology")
+            self.assertEqual(record["paragraph_ids"], [])
+            sent = adapter.sent_requests[0]
+            self.assertEqual(sent.response_format["mime_type"], "application/json")
+            self.assertEqual(sent.response_format["schema"]["type"], "array")
+
     def test_batch_context_rewrites_stable_request_and_maps_response_to_indices(self) -> None:
         stable_ids = ("part-001/page-003/paragraph-007", "part-001/page-003/paragraph-008")
         stable_response = AdapterResponse(
@@ -320,6 +355,63 @@ class TranslationRuntimeTest(unittest.TestCase):
                 ["items"]["properties"]["id"]["enum"],
                 list(stable_ids),
             )
+
+    def test_batch_and_fallback_share_stable_attempt_limit(self) -> None:
+        stable_id = "part-000/page-001/paragraph-004"
+        batch_response = AdapterResponse(
+            output_text=(
+                '{"translations":['
+                f'{{"id":"{stable_id}","translation":"批量"}}]}}'
+            ),
+            provider_request_id="provider-batch",
+            finish_reason="completed",
+            usage=response().usage,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            adapter = FakeAdapter(
+                [batch_response, response("单段"), response("不应发送")]
+            )
+            runtime, budget, _writer = self.make_runtime(directory, adapter)
+            translator = RuntimeBackedTranslator(
+                runtime=runtime,
+                lang_in="en",
+                lang_out="zh",
+                model="fake-model",
+            )
+            upstream_prompt = (
+                "rules\n\n## Here is the input:\n\n"
+                '[{"id":0,"input":"First"}]'
+            )
+
+            with translator.batch_context((stable_id,)):
+                translator.llm_translate(
+                    upstream_prompt,
+                    rate_limit_params={"request_json_mode": True},
+                )
+            with translator.paragraph_context(stable_id, "fallback"):
+                translator.translate("First", ignore_cache=True)
+            with self.assertRaises(AttemptLimitExceeded):
+                with translator.paragraph_context(stable_id, "quality_retry"):
+                    translator.translate("First", ignore_cache=True)
+
+            self.assertEqual(adapter.send_count, 2)
+            self.assertEqual(budget.snapshot().semantic_attempts[stable_id], 2)
+
+    def test_close_refuses_to_hide_unsettled_in_flight_requests(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            adapter = FakeAdapter([])
+            runtime, budget, writer = self.make_runtime(directory, adapter)
+            reservation = budget.reserve(context(), Decimal("0.01"))
+
+            with self.assertRaisesRegex(BudgetExceeded, "in-flight"):
+                runtime.close(timeout_seconds=0)
+
+            self.assertEqual(
+                budget.snapshot().abort_reason,
+                "runtime_close_timeout",
+            )
+            self.assertTrue(writer.summary_path.is_file())
+            budget.settle_not_billable(reservation, "test_cleanup")
 
 
 if __name__ == "__main__":

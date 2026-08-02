@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import threading
+import time
 import uuid
 from dataclasses import dataclass
 from decimal import Decimal
@@ -81,6 +82,7 @@ class DocumentBudget:
             max_billable_exposures_per_paragraph
         )
         self._lock = threading.RLock()
+        self._idle_condition = threading.Condition(self._lock)
         self._request_count = 0
         self._reserved_requests = 0
         self._in_flight_requests = 0
@@ -98,6 +100,7 @@ class DocumentBudget:
     def abort(self, reason: str) -> None:
         with self._lock:
             self._abort_locked(reason)
+            self._idle_condition.notify_all()
 
     def _abort_locked(self, reason: str) -> None:
         self._aborted = True
@@ -244,12 +247,23 @@ class DocumentBudget:
             overrun = actual_cost > active.reserved_cost
             if overrun:
                 self._abort_locked("budget_reservation_overrun")
+            self._idle_condition.notify_all()
             snapshot = self._snapshot_locked()
             if overrun:
                 raise BudgetAccountingError(
                     "settled cost exceeded its worst-case reservation"
                 )
             return snapshot
+
+    def wait_for_idle(self, timeout_seconds: float) -> bool:
+        deadline = time.monotonic() + max(0.0, float(timeout_seconds))
+        with self._idle_condition:
+            while self._in_flight_requests:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._idle_condition.wait(remaining)
+            return True
 
     def snapshot(self) -> BudgetSnapshot:
         with self._lock:

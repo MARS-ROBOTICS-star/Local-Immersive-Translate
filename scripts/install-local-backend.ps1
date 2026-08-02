@@ -265,6 +265,7 @@ try {
   $backendRequirements = Join-Path $InstallDir "local_babeldoc_server\requirements.txt"
   $babelDocPython = Invoke-CaptureChecked -FilePath "uv" -Arguments @("--directory", $babelDocDir, "run", "python", "-c", "import sys; print(sys.executable)")
   Invoke-Checked -FilePath "uv" -Arguments @("pip", "install", "--python", $babelDocPython, "-r", $backendRequirements)
+  Invoke-Checked -FilePath $babelDocPython -Arguments @("-c", "from google import genai; assert genai is not None")
   Invoke-Checked -FilePath $babelDocPython -Arguments @("-c", "from rapidocr import RapidOCR; RapidOCR()")
 
   Write-Host ""

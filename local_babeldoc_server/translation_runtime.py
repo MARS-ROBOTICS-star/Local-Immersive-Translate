@@ -16,6 +16,7 @@ from local_babeldoc_server.translation_audit import ApiCallRecord
 from local_babeldoc_server.translation_audit import TranslationAuditWriter
 from local_babeldoc_server.translation_batching import rewrite_batch_response_for_babeldoc
 from local_babeldoc_server.translation_batching import rewrite_babeldoc_batch_prompt
+from local_babeldoc_server.translation_budget import BudgetExceeded
 from local_babeldoc_server.translation_budget import DocumentBudget
 from local_babeldoc_server.translation_types import AdapterRequest
 from local_babeldoc_server.translation_types import AdapterResponse
@@ -64,12 +65,24 @@ class TranslationRuntime:
         self.budget.abort(reason)
         self._checkpoint()
 
+    def close(self, timeout_seconds: float = 30.0) -> None:
+        if not self.budget.wait_for_idle(timeout_seconds):
+            self.abort("runtime_close_timeout")
+            raise BudgetExceeded(
+                "translation runtime still has in-flight requests at close"
+            )
+        self._checkpoint()
+
     def request(
         self,
         context: RequestContext,
         request: AdapterRequest,
     ) -> AdapterResponse:
-        self.adapter.validate_request(request)
+        try:
+            self.adapter.validate_request(request)
+        except ModelConfigurationError:
+            self.abort("model_configuration_error")
+            raise
         self.budget.assert_semantic_attempt_available(context.paragraph_ids)
         input_token_bound = max(0, int(self.adapter.count_tokens(request)))
         worst_case_cost = self._worst_case_cost(
@@ -278,12 +291,14 @@ class RuntimeBackedTranslator:
         lang_out: str,
         model: str,
         ignore_cache: bool = False,
+        default_llm_request_category: str = "batch",
     ) -> None:
         self.runtime = runtime
         self.lang_in = lang_in
         self.lang_out = lang_out
         self.model = model
         self.ignore_cache = bool(ignore_cache)
+        self.default_llm_request_category = str(default_llm_request_category)
         self.translate_call_count = 0
         self.translate_cache_call_count = 0
         self.token_count = _AtomicCounter()
@@ -311,6 +326,34 @@ class RuntimeBackedTranslator:
         stable_ids = getattr(self._batch_local, "stable_ids", None)
         if stable_ids is not None:
             stable_ids.append(str(stable_id))
+
+    @contextmanager
+    def paragraph_context(
+        self,
+        stable_id: str,
+        request_category: str = "fallback",
+    ):
+        previous_id = getattr(self._batch_local, "paragraph_stable_id", None)
+        previous_category = getattr(
+            self._batch_local,
+            "paragraph_request_category",
+            None,
+        )
+        self._batch_local.paragraph_stable_id = str(stable_id)
+        self._batch_local.paragraph_request_category = str(request_category)
+        try:
+            yield
+        finally:
+            if previous_id is None:
+                if hasattr(self._batch_local, "paragraph_stable_id"):
+                    del self._batch_local.paragraph_stable_id
+            else:
+                self._batch_local.paragraph_stable_id = previous_id
+            if previous_category is None:
+                if hasattr(self._batch_local, "paragraph_request_category"):
+                    del self._batch_local.paragraph_request_category
+            else:
+                self._batch_local.paragraph_request_category = previous_category
 
     def add_cache_impact_parameters(self, _key: str, _value: Any) -> None:
         return None
@@ -400,16 +443,53 @@ class RuntimeBackedTranslator:
         stable_ids = tuple(
             str(value)
             for value in (
-                batch_ids or params.get("stable_ids", ())
+                batch_ids
+                or params.get("stable_ids", ())
+                or (
+                    (getattr(self._batch_local, "paragraph_stable_id"),)
+                    if getattr(self._batch_local, "paragraph_stable_id", None)
+                    else ()
+                )
             )
         )
-        if not stable_ids:
-            digest = hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
-            stable_ids = (f"unregistered/sha256-{digest}",)
         category = str(
             params.get("request_category")
-            or ("fallback" if mode == "simple" else "batch")
+            or getattr(
+                self._batch_local,
+                "paragraph_request_category",
+                None,
+            )
+            or (
+                "fallback"
+                if mode == "simple"
+                else self.default_llm_request_category
+            )
         )
+        if not stable_ids and category not in {"terminology", "model_test"}:
+            digest = hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+            stable_ids = (f"unregistered/sha256-{digest}",)
+        response_format = params.get("response_format")
+        if (
+            response_format is None
+            and category == "terminology"
+            and params.get("request_json_mode")
+        ):
+            response_format = {
+                "type": "text",
+                "mime_type": "application/json",
+                "schema": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "src": {"type": "string"},
+                            "tgt": {"type": "string"},
+                        },
+                        "required": ["src", "tgt"],
+                        "additionalProperties": False,
+                    },
+                },
+            }
         snapshot = self.runtime.budget.snapshot()
         next_semantic = max(
             (snapshot.semantic_attempts.get(item, 0) for item in stable_ids),
@@ -436,7 +516,7 @@ class RuntimeBackedTranslator:
                 response_format=(
                     rewritten_batch.response_format
                     if rewritten_batch is not None
-                    else params.get("response_format")
+                    else response_format
                 ),
                 reasoning_level="minimal",
                 extra_headers=params.get("extra_headers") or {},
