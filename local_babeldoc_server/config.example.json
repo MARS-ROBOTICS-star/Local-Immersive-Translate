@@ -90,6 +90,7 @@
       "base_url": "",
       "api_key": "env:GEMINI_API_KEY",
       "model": "",
+      "pricing_model": "gemini-3.6-flash",
       "service_tier": "standard",
       "input_usd_per_million": "1.5",
       "output_usd_per_million": "7.5",

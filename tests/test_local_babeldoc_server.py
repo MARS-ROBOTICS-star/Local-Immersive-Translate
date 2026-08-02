@@ -464,6 +464,58 @@ class AppStateOutputIntegrityTest(unittest.TestCase):
 
 
 class TranslationCompletionAuditTest(unittest.TestCase):
+    def test_one_source_preserved_item_in_large_document_is_deliverable_warning(self) -> None:
+        audit = SimpleNamespace(
+            tracking_missing=False,
+            attempted_count=358,
+            unresolved_count=1,
+            source_preserved_count=1,
+            empty_replacement_count=0,
+            protected_token_mismatch_count=0,
+        )
+
+        try:
+            result = ensure_translation_complete(
+                audit,
+                fail_on_unresolved=True,
+            )
+        except TranslationCompletenessError:
+            result = "failed"
+
+        self.assertIs(result, True)
+
+    def test_warning_threshold_rejects_four_unresolved_items(self) -> None:
+        audit = SimpleNamespace(
+            tracking_missing=False,
+            attempted_count=600,
+            unresolved_count=4,
+            source_preserved_count=4,
+            empty_replacement_count=0,
+            protected_token_mismatch_count=0,
+        )
+
+        with self.assertRaisesRegex(
+            TranslationCompletenessError,
+            "4 unresolved translatable paragraphs",
+        ):
+            ensure_translation_complete(audit, fail_on_unresolved=True)
+
+    def test_warning_threshold_rejects_more_than_one_percent(self) -> None:
+        audit = SimpleNamespace(
+            tracking_missing=False,
+            attempted_count=100,
+            unresolved_count=2,
+            source_preserved_count=2,
+            empty_replacement_count=0,
+            protected_token_mismatch_count=0,
+        )
+
+        with self.assertRaisesRegex(
+            TranslationCompletenessError,
+            "2 unresolved translatable paragraphs",
+        ):
+            ensure_translation_complete(audit, fail_on_unresolved=True)
+
     def test_expected_translation_without_tracking_cannot_pass(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             audit = audit_translation_completion(
@@ -563,6 +615,7 @@ class TranslationCompletionAuditTest(unittest.TestCase):
 
         self.assertEqual(audit.recovered_count, 1)
         self.assertEqual(audit.unresolved_count, 1)
+        self.assertEqual(audit.source_preserved_count, 1)
 
     def test_unresolved_audit_cannot_be_marked_as_success(self) -> None:
         audit = SimpleNamespace(

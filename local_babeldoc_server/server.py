@@ -44,6 +44,11 @@ DEFAULT_DATA_DIR = REPO_ROOT / ".local-babeldoc"
 DEFAULT_BABELDOC_REPO = REPO_ROOT / "BabelDOC"
 BACKEND_BUILD = "translation-runtime-safety-v1"
 
+GEMINI_STANDARD_PRICE_PROFILES: dict[str, tuple[str, str, str]] = {
+    "gemini-3.6-flash": ("1.5", "7.5", "0.15"),
+    "gemini-3.1-flash-lite": ("0.25", "1.50", "0.025"),
+}
+
 MODEL_DEFAULTS: dict[str, dict[str, str]] = {
     "kimi": {
         "label": "Kimi",
@@ -84,6 +89,7 @@ MODEL_DEFAULTS: dict[str, dict[str, str]] = {
         "base_url": "",
         "api_key": "env:GEMINI_API_KEY",
         "model": "",
+        "pricing_model": "gemini-3.6-flash",
         "service_tier": "standard",
         "input_usd_per_million": "1.5",
         "output_usd_per_million": "7.5",
@@ -282,6 +288,7 @@ class TranslationAudit:
     accepted_count: int = 0
     recovered_count: int = 0
     unresolved_count: int = 0
+    source_preserved_count: int = 0
     empty_replacement_count: int = 0
     protected_token_mismatch_count: int = 0
     reference_excluded_count: int = 0
@@ -315,6 +322,7 @@ def audit_translation_completion(
     protected_token_mismatch_count = 0
     reference_excluded_count = 0
     unresolved: list[dict[str, Any]] = []
+    source_preserved_count = 0
 
     tracking_paths = sorted(working_dir.rglob("translate_tracking.json"))
     for tracking_path in tracking_paths:
@@ -353,6 +361,8 @@ def audit_translation_completion(
                     if validation.accepted:
                         accepted_count += 1
                         continue
+                    if str(target).strip() == source.strip():
+                        source_preserved_count += 1
                     if "protected_token_mismatch" in validation.reasons:
                         protected_token_mismatch_count += 1
                     unresolved.append(
@@ -367,6 +377,11 @@ def audit_translation_completion(
 
     local_quality = local_quality or {}
     local_unresolved = int(local_quality.get("unresolved_count") or 0)
+    local_source_preserved = sum(
+        1
+        for item in local_quality.get("unresolved", [])
+        if isinstance(item, dict) and item.get("source_preserved") is True
+    )
     unresolved_count = max(len(unresolved), local_unresolved)
     if local_unresolved > len(unresolved):
         unresolved.extend(local_quality.get("unresolved", []))
@@ -378,6 +393,10 @@ def audit_translation_completion(
         accepted_count=accepted_count,
         recovered_count=int(local_quality.get("recovered_count") or 0),
         unresolved_count=unresolved_count,
+        source_preserved_count=max(
+            source_preserved_count,
+            local_source_preserved,
+        ),
         empty_replacement_count=empty_replacement_count,
         protected_token_mismatch_count=protected_token_mismatch_count,
         reference_excluded_count=reference_excluded_count,
@@ -390,7 +409,7 @@ def ensure_translation_complete(
     fail_on_unresolved: bool,
     *,
     abort_reason: str | None = None,
-) -> None:
+) -> bool:
     if getattr(audit, "tracking_missing", False):
         raise TranslationCompletenessError(
             "translation tracking is missing; completion cannot be audited"
@@ -407,10 +426,23 @@ def ensure_translation_complete(
             f"{audit.empty_replacement_count} empty paragraph replacements"
         )
     if fail_on_unresolved and audit.unresolved_count:
+        source_preserved_count = int(
+            getattr(audit, "source_preserved_count", 0) or 0
+        )
+        attempted_count = int(getattr(audit, "attempted_count", 0) or 0)
+        warning_allowed = (
+            abort_reason is None
+            and audit.unresolved_count == source_preserved_count
+            and audit.unresolved_count <= 3
+            and audit.unresolved_count / max(1, attempted_count) <= 0.01
+        )
+        if warning_allowed:
+            return True
         raise TranslationCompletenessError(
             f"translation completeness check found "
             f"{audit.unresolved_count} unresolved translatable paragraphs"
         )
+    return False
 
 PROXY_ENV_NAMES = (
     "ALL_PROXY",
@@ -803,6 +835,23 @@ class AppState:
         model_cfg.update(
             {"base_url": base_url, "api_key": api_key, "model": model}
         )
+        if provider in {"google", "gemini"}:
+            profile = GEMINI_STANDARD_PRICE_PROFILES.get(model)
+            pricing_model = str(model_cfg.get("pricing_model") or "")
+            if profile is None and pricing_model and pricing_model != model:
+                raise ValueError(
+                    f"Gemini model '{model}' has no configured price profile"
+                )
+            if profile is not None:
+                input_price, output_price, cached_price = profile
+                model_cfg.update(
+                    {
+                        "pricing_model": model,
+                        "input_usd_per_million": input_price,
+                        "output_usd_per_million": output_price,
+                        "cached_input_usd_per_million": cached_price,
+                    }
+                )
         return model_cfg
 
     def _create_translation_runtime(
@@ -1107,7 +1156,7 @@ class AppState:
         runtime_budget_snapshot = (
             runtime_budget.snapshot() if runtime_budget is not None else None
         )
-        ensure_translation_complete(
+        completed_with_warnings = ensure_translation_complete(
             audit,
             bool(babeldoc_cfg.get("fail_on_unresolved_translation", True)),
             abort_reason=getattr(runtime_budget_snapshot, "abort_reason", None),
@@ -1167,9 +1216,18 @@ class AppState:
             stage="completed",
             progress=100.0,
             message=(
-                "Translation audit passed: "
-                f"attempted={audit.attempted_count}, "
-                f"recovered={audit.recovered_count}, unresolved=0"
+                (
+                    "Translation completed with warnings: "
+                    f"attempted={audit.attempted_count}, "
+                    f"recovered={audit.recovered_count}, "
+                    f"source_preserved={audit.source_preserved_count}"
+                    if completed_with_warnings
+                    else (
+                        "Translation audit passed: "
+                        f"attempted={audit.attempted_count}, "
+                        f"recovered={audit.recovered_count}, unresolved=0"
+                    )
+                )
                 + (
                     f", source_render_pages={output_audit.page_count}"
                     if output_audit is not None

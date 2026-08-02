@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
+from decimal import Decimal
 from pathlib import Path
 
 from local_babeldoc_server.server import AppState
@@ -61,6 +62,69 @@ def make_job() -> Job:
 
 
 class ServerTranslationRuntimeTest(unittest.TestCase):
+    def test_gemini_lite_ui_override_replaces_flash_pricing(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = deep_merge(
+                DEFAULT_CONFIG,
+                {
+                    "babeldoc": {"data_dir": directory},
+                    "models": {
+                        "gemini-1": {
+                            "api_key": "secret",
+                            "model": "gemini-3.6-flash",
+                        }
+                    },
+                },
+            )
+            state = AppState(config)
+            job = make_job()
+            job.model_config = {"model": "gemini-3.1-flash-lite"}
+
+            runtime, resolved = state._create_translation_runtime(
+                job,
+                Path(directory) / "working",
+                adapter=OfflineAdapter(),
+            )
+
+        self.assertEqual(resolved["model"], "gemini-3.1-flash-lite")
+        self.assertEqual(
+            runtime.pricing.input_usd_per_million,
+            Decimal("0.25"),
+        )
+        self.assertEqual(
+            runtime.pricing.output_usd_per_million,
+            Decimal("1.50"),
+        )
+        self.assertEqual(
+            runtime.pricing.cached_input_usd_per_million,
+            Decimal("0.025"),
+        )
+
+    def test_unknown_gemini_ui_model_cannot_inherit_flash_pricing(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = deep_merge(
+                DEFAULT_CONFIG,
+                {
+                    "babeldoc": {"data_dir": directory},
+                    "models": {
+                        "gemini-1": {
+                            "api_key": "secret",
+                            "model": "gemini-3.6-flash",
+                        }
+                    },
+                },
+            )
+            state = AppState(config)
+
+            with self.assertRaisesRegex(
+                ValueError,
+                "has no configured price profile",
+            ):
+                state._resolve_model_config(
+                    "gemini-1",
+                    {"model": "gemini-unpriced-preview"},
+                )
+
     def test_deepseek_connection_override_keeps_provider_contract(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             config = deep_merge(
