@@ -64,6 +64,7 @@ class FakeAdapter:
         self.send_count = 0
         self.validate_count = 0
         self.in_flight_seen: list[int] = []
+        self.sent_requests = []
 
     def validate_request(self, request):
         self.validate_count += 1
@@ -73,6 +74,7 @@ class FakeAdapter:
 
     def send(self, request):
         self.send_count += 1
+        self.sent_requests.append(request)
         if self.budget is not None:
             self.in_flight_seen.append(
                 self.budget.snapshot().in_flight_requests
@@ -274,6 +276,50 @@ class TranslationRuntimeTest(unittest.TestCase):
             self.assertEqual(budget.snapshot().request_count, 2)
             self.assertEqual(translator.translate_call_count, 2)
             self.assertEqual(translator.token_count.value, 250)
+
+    def test_batch_context_rewrites_stable_request_and_maps_response_to_indices(self) -> None:
+        stable_ids = ("part-001/page-003/paragraph-007", "part-001/page-003/paragraph-008")
+        stable_response = AdapterResponse(
+            output_text=(
+                '{"translations":['
+                f'{{"id":"{stable_ids[1]}","translation":"第二段"}},'
+                f'{{"id":"{stable_ids[0]}","translation":"第一段"}}]}}'
+            ),
+            provider_request_id="provider-batch",
+            finish_reason="completed",
+            usage=response().usage,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            adapter = FakeAdapter([stable_response])
+            runtime, _budget, _writer = self.make_runtime(directory, adapter)
+            translator = RuntimeBackedTranslator(
+                runtime=runtime,
+                lang_in="en",
+                lang_out="zh",
+                model="fake-model",
+            )
+            upstream_prompt = (
+                "rules\n\n## Here is the input:\n\n"
+                '[{"id":0,"input":"First"},{"id":1,"input":"Second"}]'
+            )
+
+            with translator.batch_context(stable_ids):
+                translated = translator.llm_translate(
+                    upstream_prompt,
+                    rate_limit_params={"request_json_mode": True},
+                )
+
+            self.assertEqual(
+                translated,
+                '[{"id": 0, "output": "第一段"}, {"id": 1, "output": "第二段"}]',
+            )
+            sent = adapter.sent_requests[0]
+            self.assertIn(stable_ids[0], sent.input)
+            self.assertEqual(
+                sent.response_format["schema"]["properties"]["translations"]
+                ["items"]["properties"]["id"]["enum"],
+                list(stable_ids),
+            )
 
 
 if __name__ == "__main__":

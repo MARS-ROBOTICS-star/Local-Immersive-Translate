@@ -4,6 +4,7 @@ import hashlib
 import json
 import threading
 import uuid
+from contextlib import contextmanager
 from dataclasses import replace
 from datetime import datetime
 from datetime import timezone
@@ -13,6 +14,8 @@ from typing import Mapping
 
 from local_babeldoc_server.translation_audit import ApiCallRecord
 from local_babeldoc_server.translation_audit import TranslationAuditWriter
+from local_babeldoc_server.translation_batching import rewrite_batch_response_for_babeldoc
+from local_babeldoc_server.translation_batching import rewrite_babeldoc_batch_prompt
 from local_babeldoc_server.translation_budget import DocumentBudget
 from local_babeldoc_server.translation_types import AdapterRequest
 from local_babeldoc_server.translation_types import AdapterResponse
@@ -289,6 +292,25 @@ class RuntimeBackedTranslator:
         self.cache_hit_prompt_token_count = _AtomicCounter()
         self._cache: dict[tuple[str, str], str] = {}
         self._cache_lock = threading.RLock()
+        self._batch_local = threading.local()
+
+    @contextmanager
+    def batch_context(self, stable_ids: tuple[str, ...] = ()):
+        previous = getattr(self._batch_local, "stable_ids", None)
+        self._batch_local.stable_ids = list(stable_ids)
+        try:
+            yield
+        finally:
+            if previous is None:
+                if hasattr(self._batch_local, "stable_ids"):
+                    del self._batch_local.stable_ids
+            else:
+                self._batch_local.stable_ids = previous
+
+    def collect_batch_stable_id(self, stable_id: str) -> None:
+        stable_ids = getattr(self._batch_local, "stable_ids", None)
+        if stable_ids is not None:
+            stable_ids.append(str(stable_id))
 
     def add_cache_impact_parameters(self, _key: str, _value: Any) -> None:
         return None
@@ -365,7 +387,22 @@ class RuntimeBackedTranslator:
         rate_limit_params: dict | None,
     ) -> str:
         params: Mapping[str, Any] = rate_limit_params or {}
-        stable_ids = tuple(str(value) for value in params.get("stable_ids", ()))
+        collected_batch_ids = getattr(self._batch_local, "stable_ids", None)
+        batch_ids = (
+            tuple(collected_batch_ids)
+            if collected_batch_ids is not None
+            else None
+        )
+        rewritten_batch = None
+        if mode == "llm" and batch_ids and params.get("request_json_mode"):
+            rewritten_batch = rewrite_babeldoc_batch_prompt(text, batch_ids)
+            text = rewritten_batch.prompt
+        stable_ids = tuple(
+            str(value)
+            for value in (
+                batch_ids or params.get("stable_ids", ())
+            )
+        )
         if not stable_ids:
             digest = hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
             stable_ids = (f"unregistered/sha256-{digest}",)
@@ -396,7 +433,11 @@ class RuntimeBackedTranslator:
                 model=self.model,
                 input=(self._simple_prompt(text) if mode == "simple" else text),
                 max_output_tokens=int(params.get("max_output_tokens") or 4096),
-                response_format=params.get("response_format"),
+                response_format=(
+                    rewritten_batch.response_format
+                    if rewritten_batch is not None
+                    else params.get("response_format")
+                ),
                 reasoning_level="minimal",
                 extra_headers=params.get("extra_headers") or {},
             ),
@@ -409,7 +450,13 @@ class RuntimeBackedTranslator:
             + (usage.reasoning_tokens or 0)
         )
         self.cache_hit_prompt_token_count.inc(usage.cached_tokens or 0)
-        return response.output_text.strip()
+        output_text = response.output_text.strip()
+        if rewritten_batch is not None:
+            output_text, _validation = rewrite_batch_response_for_babeldoc(
+                output_text,
+                rewritten_batch.expected_ids,
+            )
+        return output_text
 
     def _simple_prompt(self, text: str) -> str:
         return (

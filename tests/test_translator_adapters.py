@@ -194,6 +194,44 @@ class TranslatorAdaptersTest(unittest.TestCase):
             "minimal",
         )
 
+    def test_openai_converts_canonical_schema_to_strict_json_schema(self) -> None:
+        completions = RecordingChatCompletions(openai_response())
+        adapter = OpenAICompatibleAdapter(
+            api_key="secret",
+            base_url="https://compatible.invalid/v1",
+            model="plain-model",
+            capabilities=NON_REASONING_CAPABILITIES,
+            default_billable_reasoning=False,
+            client=SimpleNamespace(
+                chat=SimpleNamespace(completions=completions)
+            ),
+        )
+        schema = {"type": "object", "properties": {}}
+
+        adapter.send(
+            AdapterRequest(
+                model="plain-model",
+                input="translate",
+                response_format={
+                    "type": "text",
+                    "mime_type": "application/json",
+                    "schema": schema,
+                },
+            )
+        )
+
+        self.assertEqual(
+            completions.calls[0]["response_format"],
+            {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "translations",
+                    "strict": True,
+                    "schema": schema,
+                },
+            },
+        )
+
     def test_uncontrolled_default_billable_reasoning_fails_before_send(self) -> None:
         with self.assertRaises(UncontrolledBillableReasoningError):
             OpenAICompatibleAdapter(

@@ -304,7 +304,21 @@ class OpenAICompatibleAdapter:
             "max_tokens": request.max_output_tokens,
         }
         if request.response_format is not None:
-            options["response_format"] = request.response_format
+            response_format = request.response_format
+            if (
+                response_format.get("type") == "text"
+                and response_format.get("mime_type") == "application/json"
+                and isinstance(response_format.get("schema"), dict)
+            ):
+                response_format = {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "translations",
+                        "strict": True,
+                        "schema": response_format["schema"],
+                    },
+                }
+            options["response_format"] = response_format
         if request.extra_headers:
             options["extra_headers"] = dict(request.extra_headers)
         if self.capabilities.supports_reasoning_control:
