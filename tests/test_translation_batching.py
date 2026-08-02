@@ -15,20 +15,27 @@ ALIASES = ("0", "1")
 
 
 class TranslationBatchingTest(unittest.TestCase):
-    def test_partition_targets_1000_tokens_without_old_five_paragraph_cutoff(self) -> None:
-        batches = partition_batch_indices([90] * 17)
+    def test_partition_uses_2400_3200_and_40_defaults(self) -> None:
+        batches = partition_batch_indices([10] * 81)
 
-        self.assertEqual(batches, ((0, 12), (12, 17)))
-        self.assertGreater(batches[0][1] - batches[0][0], 5)
+        self.assertEqual(batches, ((0, 40), (40, 80), (80, 81)))
 
-    def test_partition_never_exceeds_1500_tokens_or_16_paragraphs(self) -> None:
-        token_counts = [800, 600, 200] + [70] * 20
+    def test_partition_never_exceeds_3200_tokens_or_40_paragraphs(self) -> None:
+        token_counts = [1800, 1200, 300] + [70] * 50
 
         batches = partition_batch_indices(token_counts)
 
         for start, end in batches:
-            self.assertLessEqual(sum(token_counts[start:end]), 1500)
-            self.assertLessEqual(end - start, 16)
+            self.assertLessEqual(sum(token_counts[start:end]), 3200)
+            self.assertLessEqual(end - start, 40)
+
+    def test_five_page_profile_needs_at_most_ten_initial_batches(self) -> None:
+        token_counts = [11] * 358
+
+        batches = partition_batch_indices(token_counts)
+
+        self.assertLessEqual(len(batches), 10)
+        self.assertEqual(sum(end - start for start, end in batches), 358)
 
     def test_schema_has_exact_ids_count_and_closed_objects(self) -> None:
         schema = build_translation_schema(ALIASES)

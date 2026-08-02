@@ -136,9 +136,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "max_semantic_attempts_per_paragraph": 2,
         "max_billable_exposures_per_paragraph": 2,
         "explicit_transport_retries": 1,
-        "batch_target_source_tokens": 1000,
-        "batch_max_source_tokens": 1500,
-        "batch_max_paragraphs": 16,
+        "batch_target_source_tokens": 2400,
+        "batch_max_source_tokens": 3200,
+        "batch_max_paragraphs": 40,
         "max_output_tokens": 4096,
         "max_table_ocr_paragraphs": 200,
         "max_ocr_blocks_per_table": 100,
@@ -1079,13 +1079,13 @@ class AppState:
             babeldoc_cfg.get("ratio_check_min_native_paragraphs", 20)
         )
         config.batch_target_source_tokens = int(
-            babeldoc_cfg.get("batch_target_source_tokens", 1000)
+            babeldoc_cfg.get("batch_target_source_tokens", 2400)
         )
         config.batch_max_source_tokens = int(
-            babeldoc_cfg.get("batch_max_source_tokens", 1500)
+            babeldoc_cfg.get("batch_max_source_tokens", 3200)
         )
         config.batch_max_paragraphs = int(
-            babeldoc_cfg.get("batch_max_paragraphs", 16)
+            babeldoc_cfg.get("batch_max_paragraphs", 40)
         )
 
         try:

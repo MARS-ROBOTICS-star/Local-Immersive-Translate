@@ -18,9 +18,9 @@ class OversizedParagraphError(ValueError):
 def partition_batch_indices(
     token_counts: list[int] | tuple[int, ...],
     *,
-    target_tokens: int = 1000,
-    max_tokens: int = 1500,
-    max_paragraphs: int = 16,
+    target_tokens: int = 2400,
+    max_tokens: int = 3200,
+    max_paragraphs: int = 40,
 ) -> tuple[tuple[int, int], ...]:
     if target_tokens < 1 or max_tokens < target_tokens:
         raise ValueError("batch token limits are invalid")

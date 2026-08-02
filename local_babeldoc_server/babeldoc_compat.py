@@ -827,18 +827,18 @@ def install_babeldoc_compat(
                 getattr(
                     self.translation_config,
                     "batch_target_source_tokens",
-                    1000,
+                    2400,
                 )
             ),
             max_tokens=int(
                 getattr(
                     self.translation_config,
                     "batch_max_source_tokens",
-                    1500,
+                    3200,
                 )
             ),
             max_paragraphs=int(
-                getattr(self.translation_config, "batch_max_paragraphs", 16)
+                getattr(self.translation_config, "batch_max_paragraphs", 40)
             ),
         ):
             batch = paragraphs[start:end]
