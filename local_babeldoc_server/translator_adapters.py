@@ -37,6 +37,8 @@ class ProviderAdapter(Protocol):
 
     def count_tokens(self, request: AdapterRequest) -> int: ...
 
+    def validate_request(self, request: AdapterRequest) -> None: ...
+
     def send(self, request: AdapterRequest) -> AdapterResponse: ...
 
     def classify_error(self, error: Exception) -> TransportFailure: ...
@@ -164,12 +166,23 @@ class GeminiInteractionsAdapter:
             return _conservative_local_token_bound(request)
         return int(counted)
 
-    def send(self, request: AdapterRequest) -> AdapterResponse:
+    def validate_request(self, request: AdapterRequest) -> None:
         level = request.reasoning_level or "minimal"
         if level not in self.capabilities.supported_reasoning_levels:
             raise ModelConfigurationError(
                 f"unsupported Gemini reasoning level: {level}"
             )
+        if (
+            request.response_format is not None
+            and not self.capabilities.supports_structured_output
+        ):
+            raise ModelConfigurationError(
+                f"model {self.model} does not support strict structured output"
+            )
+
+    def send(self, request: AdapterRequest) -> AdapterResponse:
+        self.validate_request(request)
+        level = request.reasoning_level or "minimal"
         response = self.client.interactions.create(
             model=self.model,
             input=request.input,
@@ -265,7 +278,7 @@ class OpenAICompatibleAdapter:
     def count_tokens(self, request: AdapterRequest) -> int:
         return _conservative_local_token_bound(request)
 
-    def send(self, request: AdapterRequest) -> AdapterResponse:
+    def validate_request(self, request: AdapterRequest) -> None:
         if (
             request.response_format is not None
             and not self.capabilities.supports_structured_output
@@ -273,9 +286,21 @@ class OpenAICompatibleAdapter:
             raise ModelConfigurationError(
                 f"model {self.model} does not support strict structured output"
             )
+        if self.capabilities.supports_reasoning_control:
+            level = request.reasoning_level or "minimal"
+            if level not in self.capabilities.supported_reasoning_levels:
+                raise ModelConfigurationError(
+                    f"model {self.model} does not support reasoning level {level}"
+                )
+
+    def send(self, request: AdapterRequest) -> AdapterResponse:
+        self.validate_request(request)
+        messages = request.input
+        if isinstance(messages, str):
+            messages = [{"role": "user", "content": messages}]
         options: dict[str, Any] = {
             "model": self.model,
-            "messages": request.input,
+            "messages": messages,
             "max_tokens": request.max_output_tokens,
         }
         if request.response_format is not None:
@@ -284,10 +309,6 @@ class OpenAICompatibleAdapter:
             options["extra_headers"] = dict(request.extra_headers)
         if self.capabilities.supports_reasoning_control:
             level = request.reasoning_level or "minimal"
-            if level not in self.capabilities.supported_reasoning_levels:
-                raise ModelConfigurationError(
-                    f"model {self.model} does not support reasoning level {level}"
-                )
             options["reasoning_effort"] = level
         response = self.client.chat.completions.create(**options)
         choices = _value(response, "choices") or []
