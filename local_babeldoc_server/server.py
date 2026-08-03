@@ -15,6 +15,9 @@ import time
 import traceback
 import uuid
 from dataclasses import dataclass
+from datetime import datetime
+from datetime import timezone
+from decimal import Decimal
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler
 from http.server import ThreadingHTTPServer
@@ -32,9 +35,19 @@ if __package__ in (None, "") and str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from local_babeldoc_server.translation_quality import validate_translation
+from local_babeldoc_server.pdf_output_quality import audit_side_by_side_source
+from local_babeldoc_server.pdf_output_quality import (
+    ensure_side_by_side_source_preserved,
+)
 
 DEFAULT_DATA_DIR = REPO_ROOT / ".local-babeldoc"
 DEFAULT_BABELDOC_REPO = REPO_ROOT / "BabelDOC"
+BACKEND_BUILD = "translation-runtime-safety-v1"
+
+GEMINI_STANDARD_PRICE_PROFILES: dict[str, tuple[str, str, str]] = {
+    "gemini-3.6-flash": ("1.5", "7.5", "0.15"),
+    "gemini-3.1-flash-lite": ("0.25", "1.50", "0.025"),
+}
 
 MODEL_DEFAULTS: dict[str, dict[str, str]] = {
     "kimi": {
@@ -51,9 +64,14 @@ MODEL_DEFAULTS: dict[str, dict[str, str]] = {
     },
     "deepseek": {
         "label": "DeepSeek",
+        "provider": "deepseek",
+        "api_surface": "openai-chat-completions",
         "base_url": "",
         "api_key": "env:DEEPSEEK_API_KEY",
         "model": "",
+        "input_usd_per_million": "0.27",
+        "output_usd_per_million": "1.10",
+        "cached_input_usd_per_million": "0.135",
     },
     "glm-paid-1": {
         "label": "GLM 4.7",
@@ -69,9 +87,16 @@ MODEL_DEFAULTS: dict[str, dict[str, str]] = {
     },
     "gemini-1": {
         "label": "Gemini",
+        "provider": "google",
+        "api_surface": "interactions-v1",
         "base_url": "",
         "api_key": "env:GEMINI_API_KEY",
         "model": "",
+        "pricing_model": "gemini-3.6-flash",
+        "service_tier": "standard",
+        "input_usd_per_million": "1.5",
+        "output_usd_per_million": "7.5",
+        "cached_input_usd_per_million": "0.15",
     },
     "glm-free-1": {
         "label": "GLM-4-Flash",
@@ -113,8 +138,24 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "preserve_references": True,
         "preserve_toc_layout": True,
         "enable_translation_quality_guard": True,
-        "translation_retry_chunk_sizes": [700, 350],
-        "fail_on_unresolved_translation": True,
+    "translation_retry_chunk_sizes": [700, 350],
+    "max_requests_per_document": 500,
+    "max_estimated_cost_jpy": 300,
+        "usd_to_jpy": 150,
+        "max_semantic_attempts_per_paragraph": 2,
+        "max_billable_exposures_per_paragraph": 2,
+        "explicit_transport_retries": 1,
+        "batch_target_source_tokens": 2400,
+        "batch_max_source_tokens": 3200,
+        "batch_max_paragraphs": 40,
+        "max_output_tokens": 4096,
+        "max_table_ocr_paragraphs": 200,
+        "max_ocr_blocks_per_table": 100,
+        "max_table_ocr_to_native_ratio": 0.5,
+        "ratio_check_min_native_paragraphs": 20,
+        "min_table_translation_scale": 0.55,
+        "table_bbox_tolerance": 0.5,
+        "fail_on_unresolved_translation": False,
     },
     "models": MODEL_DEFAULTS,
 }
@@ -244,10 +285,13 @@ def start_zotero_parent_watchdog(
 
 @dataclass(frozen=True)
 class TranslationAudit:
+    tracking_file_count: int = 0
+    tracking_missing: bool = False
     attempted_count: int = 0
     accepted_count: int = 0
     recovered_count: int = 0
     unresolved_count: int = 0
+    source_preserved_count: int = 0
     empty_replacement_count: int = 0
     protected_token_mismatch_count: int = 0
     reference_excluded_count: int = 0
@@ -272,6 +316,8 @@ def audit_translation_completion(
     working_dir: Path,
     local_quality: dict[str, Any] | None,
     target_language: str,
+    *,
+    expected_translation: bool = False,
 ) -> TranslationAudit:
     attempted_count = 0
     accepted_count = 0
@@ -279,8 +325,10 @@ def audit_translation_completion(
     protected_token_mismatch_count = 0
     reference_excluded_count = 0
     unresolved: list[dict[str, Any]] = []
+    source_preserved_count = 0
 
-    for tracking_path in sorted(working_dir.rglob("translate_tracking.json")):
+    tracking_paths = sorted(working_dir.rglob("translate_tracking.json"))
+    for tracking_path in tracking_paths:
         with tracking_path.open("r", encoding="utf-8") as handle:
             tracking = json.load(handle)
         for section in ("page", "cross_page", "cross_column"):
@@ -316,6 +364,8 @@ def audit_translation_completion(
                     if validation.accepted:
                         accepted_count += 1
                         continue
+                    if str(target).strip() == source.strip():
+                        source_preserved_count += 1
                     if "protected_token_mismatch" in validation.reasons:
                         protected_token_mismatch_count += 1
                     unresolved.append(
@@ -330,15 +380,26 @@ def audit_translation_completion(
 
     local_quality = local_quality or {}
     local_unresolved = int(local_quality.get("unresolved_count") or 0)
+    local_source_preserved = sum(
+        1
+        for item in local_quality.get("unresolved", [])
+        if isinstance(item, dict) and item.get("source_preserved") is True
+    )
     unresolved_count = max(len(unresolved), local_unresolved)
     if local_unresolved > len(unresolved):
         unresolved.extend(local_quality.get("unresolved", []))
 
     return TranslationAudit(
+        tracking_file_count=len(tracking_paths),
+        tracking_missing=bool(expected_translation and not tracking_paths),
         attempted_count=attempted_count,
         accepted_count=accepted_count,
         recovered_count=int(local_quality.get("recovered_count") or 0),
         unresolved_count=unresolved_count,
+        source_preserved_count=max(
+            source_preserved_count,
+            local_source_preserved,
+        ),
         empty_replacement_count=empty_replacement_count,
         protected_token_mismatch_count=protected_token_mismatch_count,
         reference_excluded_count=reference_excluded_count,
@@ -349,17 +410,44 @@ def audit_translation_completion(
 def ensure_translation_complete(
     audit: TranslationAudit,
     fail_on_unresolved: bool,
-) -> None:
-    if audit.empty_replacement_count:
+    *,
+    abort_reason: str | None = None,
+) -> bool:
+    if getattr(audit, "tracking_missing", False):
         raise TranslationCompletenessError(
-            f"translation completeness check found "
-            f"{audit.empty_replacement_count} empty paragraph replacements"
+            "translation tracking is missing; completion cannot be audited"
         )
+    if audit.empty_replacement_count:
+        if fail_on_unresolved:
+            if abort_reason:
+                raise TranslationCompletenessError(
+                    f"translation stopped by {abort_reason}: "
+                    f"{audit.empty_replacement_count} untranslated paragraph "
+                    "attempts; source text was preserved"
+                )
+            raise TranslationCompletenessError(
+                f"translation completeness check found "
+                f"{audit.empty_replacement_count} empty paragraph replacements"
+            )
+        audit.empty_replacement_count = 0
     if fail_on_unresolved and audit.unresolved_count:
+        source_preserved_count = int(
+            getattr(audit, "source_preserved_count", 0) or 0
+        )
+        attempted_count = int(getattr(audit, "attempted_count", 0) or 0)
+        warning_allowed = (
+            abort_reason is None
+            and audit.unresolved_count == source_preserved_count
+            and audit.unresolved_count <= 3
+            and audit.unresolved_count / max(1, attempted_count) <= 0.01
+        )
+        if warning_allowed:
+            return True
         raise TranslationCompletenessError(
             f"translation completeness check found "
             f"{audit.unresolved_count} unresolved translatable paragraphs"
         )
+    return False
 
 PROXY_ENV_NAMES = (
     "ALL_PROXY",
@@ -417,6 +505,22 @@ def resolve_config_value(value: str | None) -> str:
     if value.startswith("env:"):
         return os.environ.get(value[4:], "")
     return value
+
+
+def required_nonnegative_decimal(
+    config: dict[str, Any],
+    key: str,
+) -> Decimal:
+    value = config.get(key)
+    if value is None or str(value).strip() == "":
+        raise ValueError(f"model pricing is missing: {key}")
+    try:
+        result = Decimal(str(value))
+    except Exception as error:
+        raise ValueError(f"invalid model pricing for {key}: {value!r}") from error
+    if not result.is_finite() or result < 0:
+        raise ValueError(f"model pricing must be non-negative: {key}")
+    return result
 
 
 def normalize_proxy_env() -> None:
@@ -649,9 +753,56 @@ class AppState:
         model_key: str,
         lang_out: str,
         model_config: dict[str, Any] | None = None,
+        *,
+        runtime: Any = None,
+        resolved_model_config: dict[str, Any] | None = None,
+        default_llm_request_category: str = "batch",
     ):
+        model_cfg = resolved_model_config or self._resolve_model_config(
+            model_key,
+            model_config,
+        )
+        if runtime is not None:
+            from local_babeldoc_server.translation_runtime import (
+                RuntimeBackedTranslator,
+            )
+
+            babeldoc_cfg = self.config["babeldoc"]
+            return RuntimeBackedTranslator(
+                runtime=runtime,
+                lang_in=babeldoc_cfg.get("lang_in", "en"),
+                lang_out=lang_out,
+                model=model_cfg["model"],
+                ignore_cache=bool(model_cfg.get("ignore_cache", False)),
+                default_llm_request_category=default_llm_request_category,
+            )
+
         from babeldoc.translator.translator import OpenAITranslator
 
+        babeldoc_cfg = self.config["babeldoc"]
+        return OpenAITranslator(
+            lang_in=babeldoc_cfg.get("lang_in", "en"),
+            lang_out=lang_out,
+            model=model_cfg["model"],
+            base_url=model_cfg["base_url"],
+            api_key=model_cfg["api_key"],
+            ignore_cache=bool(model_cfg.get("ignore_cache", False)),
+            enable_json_mode_if_requested=bool(
+                babeldoc_cfg.get("enable_json_mode_if_requested", False)
+            ),
+            send_dashscope_header=bool(
+                babeldoc_cfg.get("send_dashscope_header", False)
+            ),
+            send_temperature=bool(babeldoc_cfg.get("send_temperature", True)),
+            reasoning=model_cfg.get("reasoning"),
+            thinking=model_cfg.get("thinking"),
+        )
+
+    def _resolve_model_config(
+        self,
+        model_key: str,
+        model_config: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         model_cfg = self.config["models"].get(model_key)
         if not model_cfg:
             raise ValueError(f"model '{model_key}' is not configured")
@@ -671,13 +822,13 @@ class AppState:
         base_url = resolve_config_value(model_cfg.get("base_url"))
         api_key = resolve_config_value(model_cfg.get("api_key"))
         model = resolve_config_value(model_cfg.get("model"))
+        provider = str(model_cfg.get("provider") or "").casefold()
+        required_values = [("api_key", api_key), ("model", model)]
+        if provider not in {"google", "gemini"}:
+            required_values.insert(0, ("base_url", base_url))
         missing = [
             name
-            for name, value in (
-                ("base_url", base_url),
-                ("api_key", api_key),
-                ("model", model),
-            )
+            for name, value in required_values
             if not value
         ]
         if missing:
@@ -686,24 +837,166 @@ class AppState:
                 f"model '{label}' ({model_key}) is missing: {', '.join(missing)}"
             )
 
-        babeldoc_cfg = self.config["babeldoc"]
-        return OpenAITranslator(
-            lang_in=babeldoc_cfg.get("lang_in", "en"),
-            lang_out=lang_out,
-            model=model,
-            base_url=base_url,
-            api_key=api_key,
-            ignore_cache=bool(model_cfg.get("ignore_cache", False)),
-            enable_json_mode_if_requested=bool(
-                babeldoc_cfg.get("enable_json_mode_if_requested", False)
-            ),
-            send_dashscope_header=bool(
-                babeldoc_cfg.get("send_dashscope_header", False)
-            ),
-            send_temperature=bool(babeldoc_cfg.get("send_temperature", True)),
-            reasoning=model_cfg.get("reasoning"),
-            thinking=model_cfg.get("thinking"),
+        model_cfg.update(
+            {"base_url": base_url, "api_key": api_key, "model": model}
         )
+        if provider in {"google", "gemini"}:
+            profile = GEMINI_STANDARD_PRICE_PROFILES.get(model)
+            pricing_model = str(model_cfg.get("pricing_model") or "")
+            if profile is None and pricing_model and pricing_model != model:
+                raise ValueError(
+                    f"Gemini model '{model}' has no configured price profile"
+                )
+            if profile is not None:
+                input_price, output_price, cached_price = profile
+                model_cfg.update(
+                    {
+                        "pricing_model": model,
+                        "input_usd_per_million": input_price,
+                        "output_usd_per_million": output_price,
+                        "cached_input_usd_per_million": cached_price,
+                    }
+                )
+        return model_cfg
+
+    def _create_translation_runtime(
+        self,
+        job: Job,
+        working_dir: Path,
+        *,
+        adapter: Any = None,
+    ) -> tuple[Any, dict[str, Any]]:
+        from local_babeldoc_server.translation_audit import TranslationAuditWriter
+        from local_babeldoc_server.translation_budget import DocumentBudget
+        from local_babeldoc_server.translation_runtime import TranslationRuntime
+        from local_babeldoc_server.translation_types import PricingSnapshot
+        from local_babeldoc_server.translator_adapters import resolve_adapter
+
+        model_cfg = self._resolve_model_config(
+            job.request_model,
+            job.model_config,
+        )
+        if adapter is None:
+            adapter = resolve_adapter(model_cfg)
+        babeldoc_cfg = self.config["babeldoc"]
+        usd_to_jpy = required_nonnegative_decimal(
+            babeldoc_cfg,
+            "usd_to_jpy",
+        )
+        if usd_to_jpy == 0:
+            raise ValueError("usd_to_jpy must be greater than zero")
+        pricing = PricingSnapshot(
+            provider=str(model_cfg.get("provider") or "compatible"),
+            model=str(model_cfg["model"]),
+            api_surface=str(
+                model_cfg.get("api_surface") or "openai-chat-completions"
+            ),
+            service_tier=str(model_cfg.get("service_tier") or "standard"),
+            input_usd_per_million=required_nonnegative_decimal(
+                model_cfg,
+                "input_usd_per_million",
+            ),
+            output_usd_per_million=required_nonnegative_decimal(
+                model_cfg,
+                "output_usd_per_million",
+            ),
+            cached_input_usd_per_million=required_nonnegative_decimal(
+                model_cfg,
+                "cached_input_usd_per_million",
+            ),
+            usd_to_jpy=usd_to_jpy,
+            tax_included=bool(model_cfg.get("tax_included", False)),
+            captured_at=datetime.now(timezone.utc).isoformat(),
+        )
+        max_cost_usd = Decimal(
+            str(babeldoc_cfg.get("max_estimated_cost_jpy", 300))
+        ) / usd_to_jpy
+        budget = DocumentBudget(
+            max_requests=int(
+                babeldoc_cfg.get("max_requests_per_document", 150)
+            ),
+            max_cost_usd=max_cost_usd,
+            max_semantic_attempts_per_paragraph=int(
+                babeldoc_cfg.get("max_semantic_attempts_per_paragraph", 2)
+            ),
+            max_billable_exposures_per_paragraph=int(
+                babeldoc_cfg.get("max_billable_exposures_per_paragraph", 2)
+            ),
+        )
+        writer = TranslationAuditWriter(working_dir, pricing)
+        return (
+            TranslationRuntime(
+                adapter=adapter,
+                budget=budget,
+                audit_writer=writer,
+                pricing=pricing,
+                explicit_transport_retries=int(
+                    babeldoc_cfg.get("explicit_transport_retries", 1)
+                ),
+            ),
+            model_cfg,
+        )
+
+    def test_model(
+        self,
+        model_key: str,
+        lang_out: str,
+        model_config: dict[str, Any] | None = None,
+        *,
+        adapter: Any = None,
+    ) -> dict[str, str]:
+        test_id = uuid.uuid4().hex
+        job = Job(
+            pdf_id=f"model-test-{test_id}",
+            object_key="",
+            file_name="",
+            request_model=model_key,
+            target_language=lang_out,
+            model_config=model_config,
+            options={},
+            created_at=time.time(),
+        )
+        runtime, resolved_model_cfg = self._create_translation_runtime(
+            job,
+            self.working_dir / "model-tests" / test_id,
+            adapter=adapter,
+        )
+        translator = self._create_translator(
+            model_key,
+            lang_out,
+            model_config,
+            runtime=runtime,
+            resolved_model_config=resolved_model_cfg,
+        )
+        response_format = {
+            "type": "text",
+            "mime_type": "application/json",
+            "schema": {
+                "type": "object",
+                "properties": {"translation": {"type": "string"}},
+                "required": ["translation"],
+                "additionalProperties": False,
+            },
+        }
+        output = translator.do_translate(
+            "Hello.",
+            rate_limit_params={
+                "document_id": job.pdf_id,
+                "request_category": "model_test",
+                "response_format": response_format,
+                "max_output_tokens": 128,
+            },
+        )
+        try:
+            payload = json.loads(output)
+        except json.JSONDecodeError as error:
+            raise RuntimeError("model test returned invalid structured JSON") from error
+        translation = str(payload.get("translation") or "").strip()
+        if not translation:
+            raise RuntimeError(
+                f"model '{model_key}' returned an empty response during test"
+            )
+        return {"translation": translation}
 
     def _run_babeldoc(self, pdf_id: str) -> None:
         self._ensure_babeldoc_compat()
@@ -722,18 +1015,31 @@ class AppState:
 
         babeldoc_cfg = self.config["babeldoc"]
         lang_out = normalize_lang_out(job.target_language)
-        translator = self._create_translator(
-            job.request_model,
-            lang_out,
-            job.model_config,
-        )
-        qps = int(babeldoc_cfg.get("qps") or 4)
-        set_translate_rate_limiter(qps)
-
         job_output_dir = self.output_dir / pdf_id
         job_working_dir = self.working_dir / pdf_id
         job_output_dir.mkdir(parents=True, exist_ok=True)
         job_working_dir.mkdir(parents=True, exist_ok=True)
+        runtime, resolved_model_cfg = self._create_translation_runtime(
+            job,
+            job_working_dir,
+        )
+        translator = self._create_translator(
+            job.request_model,
+            lang_out,
+            job.model_config,
+            runtime=runtime,
+            resolved_model_config=resolved_model_cfg,
+        )
+        term_translator = self._create_translator(
+            job.request_model,
+            lang_out,
+            job.model_config,
+            runtime=runtime,
+            resolved_model_config=resolved_model_cfg,
+            default_llm_request_category="terminology",
+        )
+        qps = int(babeldoc_cfg.get("qps") or 4)
+        set_translate_rate_limiter(qps)
 
         split_strategy = None
         max_pages = int(babeldoc_cfg.get("max_pages_per_part") or 0)
@@ -758,7 +1064,7 @@ class AppState:
             output_dir=str(job_output_dir),
             working_dir=str(job_working_dir),
             translator=translator,
-            term_extraction_translator=translator,
+            term_extraction_translator=term_translator,
             debug=bool(babeldoc_cfg.get("debug", False)),
             lang_in=babeldoc_cfg.get("lang_in", "en"),
             lang_out=lang_out,
@@ -803,24 +1109,62 @@ class AppState:
             remove_non_formula_lines=bool(
                 babeldoc_cfg.get("remove_non_formula_lines", False)
             ),
-            disable_same_text_fallback=bool(
-                babeldoc_cfg.get("disable_same_text_fallback", False)
+            disable_same_text_fallback=(
+                bool(babeldoc_cfg.get("enable_translation_quality_guard", True))
+                or bool(babeldoc_cfg.get("disable_same_text_fallback", False))
             ),
             metadata_extra_data=f"local_zotero_{pdf_id}",
         )
         config.translation_retry_chunk_sizes = list(
             babeldoc_cfg.get("translation_retry_chunk_sizes", [700, 350])
         )
+        config.local_translation_runtime = runtime
+        config.local_part_index = 0
+        config.local_ocr_safety_snapshots = {}
+        config.max_table_ocr_paragraphs = int(
+            babeldoc_cfg.get("max_table_ocr_paragraphs", 200)
+        )
+        config.max_ocr_blocks_per_table = int(
+            babeldoc_cfg.get("max_ocr_blocks_per_table", 100)
+        )
+        config.max_table_ocr_to_native_ratio = float(
+            babeldoc_cfg.get("max_table_ocr_to_native_ratio", 0.5)
+        )
+        config.ratio_check_min_native_paragraphs = int(
+            babeldoc_cfg.get("ratio_check_min_native_paragraphs", 20)
+        )
+        config.batch_target_source_tokens = int(
+            babeldoc_cfg.get("batch_target_source_tokens", 2400)
+        )
+        config.batch_max_source_tokens = int(
+            babeldoc_cfg.get("batch_max_source_tokens", 3200)
+        )
+        config.batch_max_paragraphs = int(
+            babeldoc_cfg.get("batch_max_paragraphs", 40)
+        )
 
-        result = asyncio.run(self._consume_translate_events(pdf_id, async_translate, config))
+        try:
+            result = asyncio.run(
+                self._consume_translate_events(pdf_id, async_translate, config)
+            )
+        finally:
+            runtime.close()
         audit = audit_translation_completion(
             job_working_dir,
             getattr(config, "local_translation_quality", None),
             lang_out,
+            expected_translation=bool(
+                getattr(result, "total_valid_character_count", 0) or 0
+            ),
         )
-        ensure_translation_complete(
+        runtime_budget = getattr(runtime, "budget", None)
+        runtime_budget_snapshot = (
+            runtime_budget.snapshot() if runtime_budget is not None else None
+        )
+        completed_with_warnings = ensure_translation_complete(
             audit,
             bool(babeldoc_cfg.get("fail_on_unresolved_translation", True)),
+            abort_reason=getattr(runtime_budget_snapshot, "abort_reason", None),
         )
         mono_path = result.no_watermark_mono_pdf_path or result.mono_pdf_path
         dual_path = result.no_watermark_dual_pdf_path or result.dual_pdf_path
@@ -829,15 +1173,71 @@ class AppState:
         if not dual_path:
             raise RuntimeError("BabelDOC did not produce a dual PDF")
 
+        dual_mode = (job.options.get("dual_mode") or "lort").casefold()
+        output_audit = None
+        if dual_mode in {"lort", "ltro"}:
+            output_audit = audit_side_by_side_source(
+                source_path,
+                dual_path,
+                dual_mode,
+            )
+            ensure_side_by_side_source_preserved(output_audit)
+
+        budget_snapshot = runtime.budget.snapshot()
+        ocr_report = getattr(config, "local_ocr_safety_report", None)
+        ocr_snapshots = list(
+            getattr(config, "local_ocr_safety_snapshots", {}).values()
+        )
+        native_paragraphs = sum(
+            item.native_paragraphs for item in ocr_snapshots
+        )
+        table_ocr_paragraphs = sum(
+            item.table_ocr_paragraphs for item in ocr_snapshots
+        )
+        image_ocr_paragraphs = sum(
+            item.image_ocr_paragraphs for item in ocr_snapshots
+        )
+        if not ocr_snapshots and ocr_report is not None:
+            native_paragraphs = ocr_report.native_paragraphs
+            table_ocr_paragraphs = ocr_report.table_ocr_paragraphs
+            image_ocr_paragraphs = ocr_report.image_ocr_paragraphs
+        runtime.audit_writer.checkpoint(
+            {
+                "reserved_cost_usd": budget_snapshot.reserved_cost,
+                "committed_cost_usd": budget_snapshot.committed_cost,
+                "in_flight_requests": budget_snapshot.in_flight_requests,
+                "completed_requests": budget_snapshot.completed_requests,
+                "abort_reason": budget_snapshot.abort_reason,
+                "native_paragraphs": native_paragraphs,
+                "table_ocr_paragraphs": table_ocr_paragraphs,
+                "image_ocr_paragraphs": image_ocr_paragraphs,
+            }
+        )
+        runtime.audit_writer.publish(job_output_dir)
+
         self.update_job(
             pdf_id,
             status="success",
             stage="completed",
             progress=100.0,
             message=(
-                "Translation audit passed: "
-                f"attempted={audit.attempted_count}, "
-                f"recovered={audit.recovered_count}, unresolved=0"
+                (
+                    "Translation completed with warnings: "
+                    f"attempted={audit.attempted_count}, "
+                    f"recovered={audit.recovered_count}, "
+                    f"source_preserved={audit.source_preserved_count}"
+                    if completed_with_warnings
+                    else (
+                        "Translation audit passed: "
+                        f"attempted={audit.attempted_count}, "
+                        f"recovered={audit.recovered_count}, unresolved=0"
+                    )
+                )
+                + (
+                    f", source_render_pages={output_audit.page_count}"
+                    if output_audit is not None
+                    else ""
+                )
             ),
             translation_pdf_path=str(mono_path),
             dual_pdf_path=str(dual_path),
@@ -951,7 +1351,10 @@ class LocalBabelDOCHandler(BaseHTTPRequestHandler):
         path = self._normalized_path()
 
         if path == "/healthz":
-            self._send_json(HTTPStatus.OK, {"status": "ok"})
+            self._send_json(
+                HTTPStatus.OK,
+                {"status": "ok", "backend_build": BACKEND_BUILD},
+            )
             return
 
         if not self.server.state.is_authorized(self):
@@ -1019,20 +1422,16 @@ class LocalBabelDOCHandler(BaseHTTPRequestHandler):
                 if isinstance(body.get("modelConfig"), dict)
                 else None
             )
-            translator = self.server.state._create_translator(
+            result = self.server.state.test_model(
                 model_key,
                 normalize_lang_out(target_language),
                 model_config,
             )
-            translated = (translator.do_translate("Hello.") or "").strip()
-            if not translated:
-                raise RuntimeError(
-                    f"model '{model_key}' returned an empty response during test"
-                )
             self._send_ok(
                 {
                     "model": model_key,
                     "message": "model API is reachable",
+                    "translation": result["translation"],
                 }
             )
             return

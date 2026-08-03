@@ -31,7 +31,23 @@
     "preserve_toc_layout": true,
     "enable_translation_quality_guard": true,
     "translation_retry_chunk_sizes": [700, 350],
-    "fail_on_unresolved_translation": true
+    "max_requests_per_document": 500,
+    "max_estimated_cost_jpy": 300,
+    "usd_to_jpy": 150,
+    "max_semantic_attempts_per_paragraph": 2,
+    "max_billable_exposures_per_paragraph": 2,
+    "explicit_transport_retries": 1,
+    "batch_target_source_tokens": 2400,
+    "batch_max_source_tokens": 3200,
+    "batch_max_paragraphs": 40,
+    "max_output_tokens": 4096,
+    "max_table_ocr_paragraphs": 200,
+    "max_ocr_blocks_per_table": 100,
+    "max_table_ocr_to_native_ratio": 0.5,
+    "ratio_check_min_native_paragraphs": 20,
+    "min_table_translation_scale": 0.55,
+    "table_bbox_tolerance": 0.5,
+    "fail_on_unresolved_translation": false
   },
   "models": {
     "kimi": {
@@ -48,10 +64,15 @@
     },
     "deepseek": {
       "label": "DeepSeek",
+      "provider": "deepseek",
+      "api_surface": "openai-chat-completions",
       "base_url": "",
       "api_key": "env:DEEPSEEK_API_KEY",
       "model": "",
-      "thinking": "disabled"
+      "thinking": "disabled",
+      "input_usd_per_million": "0.27",
+      "output_usd_per_million": "1.10",
+      "cached_input_usd_per_million": "0.135"
     },
     "glm-paid-1": {
       "label": "GLM 4.7",
@@ -67,9 +88,16 @@
     },
     "gemini-1": {
       "label": "Gemini",
+      "provider": "google",
+      "api_surface": "interactions-v1",
       "base_url": "",
       "api_key": "env:GEMINI_API_KEY",
-      "model": ""
+      "model": "",
+      "pricing_model": "gemini-3.6-flash",
+      "service_tier": "standard",
+      "input_usd_per_million": "1.5",
+      "output_usd_per_million": "7.5",
+      "cached_input_usd_per_million": "0.15"
     },
     "glm-free-1": {
       "label": "GLM-4-Flash",

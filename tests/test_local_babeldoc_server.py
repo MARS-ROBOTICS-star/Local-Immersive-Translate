@@ -7,9 +7,15 @@ import types
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock
 from unittest.mock import patch
 
+import local_babeldoc_server.server as server_module
+from local_babeldoc_server.pdf_output_quality import PdfOutputAudit
+from local_babeldoc_server.pdf_output_quality import PdfOutputIntegrityError
 from local_babeldoc_server.server import AppState
+from local_babeldoc_server.server import Job
+from local_babeldoc_server.server import LocalBabelDOCHandler
 from local_babeldoc_server.server import TranslationCompletenessError
 from local_babeldoc_server.server import audit_translation_completion
 from local_babeldoc_server.server import ensure_translation_complete
@@ -161,6 +167,20 @@ class ZoteroParentWatchdogTest(unittest.TestCase):
 
 
 class ServerEntrypointTest(unittest.TestCase):
+    def test_health_endpoint_identifies_runtime_safety_build(self) -> None:
+        handler = LocalBabelDOCHandler.__new__(LocalBabelDOCHandler)
+        handler.path = "/healthz"
+        sent = []
+        handler._send_json = lambda status, payload: sent.append((status, payload))
+
+        handler._handle_get()
+
+        self.assertEqual(sent[0][1]["status"], "ok")
+        self.assertEqual(
+            sent[0][1]["backend_build"],
+            "translation-runtime-safety-v1",
+        )
+
     def test_direct_script_start_works_outside_project_directory(self) -> None:
         server_script = PROJECT_ROOT / "local_babeldoc_server" / "server.py"
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -233,7 +253,7 @@ class StructureRepairConfigTest(unittest.TestCase):
         self.assertIs(babeldoc["preserve_toc_layout"], True)
         self.assertIs(babeldoc["enable_translation_quality_guard"], True)
         self.assertEqual(babeldoc["translation_retry_chunk_sizes"], [700, 350])
-        self.assertIs(babeldoc["fail_on_unresolved_translation"], True)
+        self.assertIs(babeldoc["fail_on_unresolved_translation"], False)
 
     def test_table_ocr_runtime_is_lazy_reused_and_can_be_disabled(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -315,7 +335,203 @@ class AppStateTranslateEventsTest(unittest.TestCase):
             self.assertIs(result, expected_result)
 
 
+class AppStateOutputIntegrityTest(unittest.TestCase):
+    def test_source_render_failure_prevents_successful_job_publication(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            data_dir = Path(temp_dir)
+            state = AppState(make_config(data_dir))
+            source_path = state.upload_dir / "source.pdf"
+            source_path.write_bytes(b"%PDF-1.7\nsource\n")
+            mono_path = data_dir / "translated.mono.pdf"
+            dual_path = data_dir / "translated.dual.pdf"
+            mono_path.write_bytes(b"%PDF-1.7\nmono\n")
+            dual_path.write_bytes(b"%PDF-1.7\ndual\n")
+            job = Job(
+                pdf_id="render-audit-job",
+                object_key=source_path.name,
+                file_name=source_path.name,
+                request_model="test-model",
+                target_language="zh-CN",
+                model_config=None,
+                options={"dual_mode": "lort"},
+                created_at=1.0,
+            )
+            state.add_job(job)
+
+            class FakeTranslationConfig:
+                def __init__(self, **kwargs):
+                    self.__dict__.update(kwargs)
+
+                @staticmethod
+                def create_max_pages_per_part_split_strategy(max_pages):
+                    return ("split", max_pages)
+
+            class FakeWatermarkOutputMode:
+                NoWatermark = "no-watermark"
+                Watermarked = "watermarked"
+
+            async def fake_async_translate(_config):
+                yield {
+                    "type": "finish",
+                    "translate_result": SimpleNamespace(
+                        no_watermark_mono_pdf_path=mono_path,
+                        mono_pdf_path=None,
+                        no_watermark_dual_pdf_path=dual_path,
+                        dual_pdf_path=None,
+                        total_seconds=1.5,
+                    ),
+                }
+
+            babeldoc = types.ModuleType("babeldoc")
+            babeldoc.__path__ = []
+            format_package = types.ModuleType("babeldoc.format")
+            format_package.__path__ = []
+            pdf_package = types.ModuleType("babeldoc.format.pdf")
+            pdf_package.__path__ = []
+            high_level = types.ModuleType("babeldoc.format.pdf.high_level")
+            high_level.async_translate = fake_async_translate
+            translation_config = types.ModuleType(
+                "babeldoc.format.pdf.translation_config"
+            )
+            translation_config.TranslationConfig = FakeTranslationConfig
+            translation_config.WatermarkOutputMode = FakeWatermarkOutputMode
+            translator_package = types.ModuleType("babeldoc.translator")
+            translator_package.__path__ = []
+            translator = types.ModuleType("babeldoc.translator.translator")
+            translator.set_translate_rate_limiter = lambda _qps: None
+            failed_audit = PdfOutputAudit(
+                passed=False,
+                page_count=1,
+                pages=(),
+                failed_pages=(1,),
+                failure_reason="source_render_mismatch",
+            )
+            fake_runtime = SimpleNamespace(close=Mock())
+
+            with (
+                patch.dict(
+                    sys.modules,
+                    {
+                        "babeldoc": babeldoc,
+                        "babeldoc.format": format_package,
+                        "babeldoc.format.pdf": pdf_package,
+                        "babeldoc.format.pdf.high_level": high_level,
+                        "babeldoc.format.pdf.translation_config": translation_config,
+                        "babeldoc.translator": translator_package,
+                        "babeldoc.translator.translator": translator,
+                    },
+                ),
+                patch.object(state, "_ensure_babeldoc_compat"),
+                patch.object(
+                    state,
+                    "_create_translation_runtime",
+                    return_value=(fake_runtime, {"model": "test-model"}),
+                ),
+                patch.object(state, "_create_translator", return_value=object()),
+                patch.object(state, "_get_doc_layout_model", return_value=object()),
+                patch.object(
+                    server_module,
+                    "audit_translation_completion",
+                    return_value=SimpleNamespace(
+                        attempted_count=4,
+                        recovered_count=0,
+                        unresolved_count=0,
+                        empty_replacement_count=0,
+                        protected_token_mismatch_count=0,
+                    ),
+                ),
+                patch.object(
+                    server_module,
+                    "audit_side_by_side_source",
+                    return_value=failed_audit,
+                    create=True,
+                ),
+                patch.object(
+                    server_module,
+                    "ensure_side_by_side_source_preserved",
+                    side_effect=PdfOutputIntegrityError(
+                        "Dual PDF source rendering differs on page 1"
+                    ),
+                    create=True,
+                ),
+            ):
+                with self.assertRaises(PdfOutputIntegrityError):
+                    state._run_babeldoc(job.pdf_id)
+
+            self.assertNotEqual(job.status, "success")
+            self.assertEqual(job.dual_pdf_path, "")
+            fake_runtime.close.assert_called_once_with()
+
+
 class TranslationCompletionAuditTest(unittest.TestCase):
+    def test_one_source_preserved_item_in_large_document_is_deliverable_warning(self) -> None:
+        audit = SimpleNamespace(
+            tracking_missing=False,
+            attempted_count=358,
+            unresolved_count=1,
+            source_preserved_count=1,
+            empty_replacement_count=0,
+            protected_token_mismatch_count=0,
+        )
+
+        try:
+            result = ensure_translation_complete(
+                audit,
+                fail_on_unresolved=True,
+            )
+        except TranslationCompletenessError:
+            result = "failed"
+
+        self.assertIs(result, True)
+
+    def test_warning_threshold_rejects_four_unresolved_items(self) -> None:
+        audit = SimpleNamespace(
+            tracking_missing=False,
+            attempted_count=600,
+            unresolved_count=4,
+            source_preserved_count=4,
+            empty_replacement_count=0,
+            protected_token_mismatch_count=0,
+        )
+
+        with self.assertRaisesRegex(
+            TranslationCompletenessError,
+            "4 unresolved translatable paragraphs",
+        ):
+            ensure_translation_complete(audit, fail_on_unresolved=True)
+
+    def test_warning_threshold_rejects_more_than_one_percent(self) -> None:
+        audit = SimpleNamespace(
+            tracking_missing=False,
+            attempted_count=100,
+            unresolved_count=2,
+            source_preserved_count=2,
+            empty_replacement_count=0,
+            protected_token_mismatch_count=0,
+        )
+
+        with self.assertRaisesRegex(
+            TranslationCompletenessError,
+            "2 unresolved translatable paragraphs",
+        ):
+            ensure_translation_complete(audit, fail_on_unresolved=True)
+
+    def test_expected_translation_without_tracking_cannot_pass(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            audit = audit_translation_completion(
+                Path(temp_dir),
+                None,
+                "zh",
+                expected_translation=True,
+            )
+
+        self.assertTrue(audit.tracking_missing)
+        with self.assertRaisesRegex(
+            TranslationCompletenessError,
+            "translation tracking is missing",
+        ):
+            ensure_translation_complete(audit, fail_on_unresolved=True)
+
     def test_detects_empty_and_unchanged_attempted_translations_but_skips_references(self) -> None:
         tracking = {
             "page": [
@@ -399,6 +615,7 @@ class TranslationCompletionAuditTest(unittest.TestCase):
 
         self.assertEqual(audit.recovered_count, 1)
         self.assertEqual(audit.unresolved_count, 1)
+        self.assertEqual(audit.source_preserved_count, 1)
 
     def test_unresolved_audit_cannot_be_marked_as_success(self) -> None:
         audit = SimpleNamespace(
@@ -412,6 +629,24 @@ class TranslationCompletionAuditTest(unittest.TestCase):
             "3 unresolved translatable paragraphs",
         ):
             ensure_translation_complete(audit, fail_on_unresolved=True)
+
+    def test_request_budget_failure_reports_preserved_source_text(self) -> None:
+        audit = SimpleNamespace(
+            tracking_missing=False,
+            unresolved_count=260,
+            empty_replacement_count=260,
+            protected_token_mismatch_count=0,
+        )
+
+        with self.assertRaisesRegex(
+            TranslationCompletenessError,
+            "budget_request_limit.*260 untranslated.*source text was preserved",
+        ):
+            ensure_translation_complete(
+                audit,
+                fail_on_unresolved=True,
+                abort_reason="budget_request_limit",
+            )
 
 
 class InstallerVersionTest(unittest.TestCase):

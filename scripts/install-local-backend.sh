@@ -145,6 +145,7 @@ clone_or_update "$BABELDOC_URL" "$INSTALL_DIR/BabelDOC" "$BABELDOC_REF" "pyproje
 uv --directory "$INSTALL_DIR/BabelDOC" sync
 babeldoc_python="$(uv --directory "$INSTALL_DIR/BabelDOC" run python -c 'import sys; print(sys.executable)')"
 uv pip install --python "$babeldoc_python" -r "$INSTALL_DIR/local_babeldoc_server/requirements.txt"
+"$babeldoc_python" -c 'from google import genai; assert genai is not None'
 "$babeldoc_python" -c 'from rapidocr import RapidOCR; RapidOCR()'
 
 printf '\nProject directory: %s\n' "$INSTALL_DIR"
