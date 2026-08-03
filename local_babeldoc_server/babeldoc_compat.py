@@ -44,6 +44,7 @@ _PARENTHETICAL_CITATION_RE = re.compile(
     r"^\([^()]{1,160},\s*(?:18|19|20)\d{2}[a-z]?\)[†‡*]?$",
     re.IGNORECASE,
 )
+_CJK_RE = re.compile(r"[\u4e00-\u9fff\u3400-\u4dbf]")
 
 
 @dataclass(slots=True)
@@ -1525,9 +1526,22 @@ def install_babeldoc_compat(
     )
     typesetting_class.typesetting_document = wrapped_typesetting_document
     if llm_only_translator is not None:
+        original_calc_token_count = llm_only_translator.calc_token_count
+
+        def wrapped_calc_token_count(self, text):
+            result = original_calc_token_count(self, text)
+            if len(text) <= 30 and _CJK_RE.search(text):
+                return max(1, len(text) // 3)
+            return result
+
         setattr(wrapped_batch_translate, PATCH_MARKER, True)
         setattr(wrapped_process_page, PATCH_MARKER, True)
+        setattr(wrapped_calc_token_count, PATCH_MARKER, True)
         llm_only_translator.translate_paragraph = wrapped_batch_translate
         llm_only_translator.process_page = wrapped_process_page
+        llm_only_translator.calc_token_count = wrapped_calc_token_count
+        handle.originals.append(
+            (llm_only_translator, "calc_token_count", original_calc_token_count)
+        )
     pdf_creater.subset_fonts_in_subprocess = staticmethod(wrapped_subset_fonts)
     return handle

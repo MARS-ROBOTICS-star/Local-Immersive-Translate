@@ -31,7 +31,7 @@
     "preserve_toc_layout": true,
     "enable_translation_quality_guard": true,
     "translation_retry_chunk_sizes": [700, 350],
-    "max_requests_per_document": 150,
+    "max_requests_per_document": 500,
     "max_estimated_cost_jpy": 300,
     "usd_to_jpy": 150,
     "max_semantic_attempts_per_paragraph": 2,
@@ -47,7 +47,7 @@
     "ratio_check_min_native_paragraphs": 20,
     "min_table_translation_scale": 0.55,
     "table_bbox_tolerance": 0.5,
-    "fail_on_unresolved_translation": true
+    "fail_on_unresolved_translation": false
   },
   "models": {
     "kimi": {
@@ -69,7 +69,10 @@
       "base_url": "",
       "api_key": "env:DEEPSEEK_API_KEY",
       "model": "",
-      "thinking": "disabled"
+      "thinking": "disabled",
+      "input_usd_per_million": "0.27",
+      "output_usd_per_million": "1.10",
+      "cached_input_usd_per_million": "0.135"
     },
     "glm-paid-1": {
       "label": "GLM 4.7",

@@ -736,7 +736,7 @@ class RuntimeBackedTranslator:
             f"Translate the following plain text into {self.lang_out}. "
             "Preserve every number and unit exactly as written; do not "
             "convert numeric notation into words or different units. "
-            "Return the translation only.\n\n"
+            "Return the translation in JSON format only.\n\n"
             f"{text}"
         )
 

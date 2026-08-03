@@ -162,7 +162,7 @@ class ServerTranslationRuntimeTest(unittest.TestCase):
     def test_default_config_contains_hard_budget_batch_and_ocr_limits(self) -> None:
         babeldoc = DEFAULT_CONFIG["babeldoc"]
 
-        self.assertEqual(babeldoc["max_requests_per_document"], 150)
+        self.assertEqual(babeldoc["max_requests_per_document"], 500)
         self.assertEqual(babeldoc["max_estimated_cost_jpy"], 300)
         self.assertEqual(babeldoc["max_semantic_attempts_per_paragraph"], 2)
         self.assertEqual(babeldoc["max_billable_exposures_per_paragraph"], 2)
@@ -209,7 +209,7 @@ class ServerTranslationRuntimeTest(unittest.TestCase):
 
             self.assertIsInstance(translator, RuntimeBackedTranslator)
             snapshot = runtime.budget.snapshot()
-            self.assertEqual(snapshot.request_limit, 150)
+            self.assertEqual(snapshot.request_limit, 500)
             self.assertEqual(str(snapshot.cost_limit_usd), "2")
             self.assertEqual(runtime.pricing.api_surface, "interactions-v1")
             self.assertEqual(runtime.pricing.input_usd_per_million, 1.5)
@@ -266,7 +266,7 @@ class ServerTranslationRuntimeTest(unittest.TestCase):
                 {
                     "babeldoc": {"data_dir": directory},
                     "models": {
-                        "deepseek": {
+                        "gpt-1": {
                             "base_url": "https://example.invalid/v1",
                             "api_key": "secret",
                             "model": "plain-model",
@@ -285,7 +285,7 @@ class ServerTranslationRuntimeTest(unittest.TestCase):
                         pdf_id="doc-price",
                         object_key="paper.pdf",
                         file_name="paper.pdf",
-                        request_model="deepseek",
+                        request_model="gpt-1",
                         target_language="zh",
                         model_config=None,
                         options={},

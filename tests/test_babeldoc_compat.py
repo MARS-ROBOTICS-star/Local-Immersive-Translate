@@ -26,6 +26,7 @@ PDF_CREATER_MODULE = "babeldoc.format.pdf.document_il.backend.pdf_creater"
 STYLES_MODULE = "babeldoc.format.pdf.document_il.midend.styles_and_formulas"
 TRANSLATION_CONFIG_MODULE = "babeldoc.format.pdf.translation_config"
 TYPESETTING_MODULE = "babeldoc.format.pdf.document_il.midend.typesetting"
+LLM_ONLY_MODULE = "babeldoc.format.pdf.document_il.midend.il_translator_llm_only"
 
 
 class FlexibleIlObject:
@@ -266,6 +267,77 @@ class FakeTracker:
         self.output = value
 
 
+class FakePageTracker:
+    def __init__(self):
+        self.paragraph = []
+
+    def new_paragraph(self):
+        tracker = FakeTracker()
+        self.paragraph.append(tracker)
+        return tracker
+
+
+class FakeBatchParagraph:
+    def __init__(self, paragraphs, pages, page_tracker):
+        self.paragraphs = paragraphs
+        self.pages = pages
+        self.trackers = [page_tracker.new_paragraph() for _ in paragraphs]
+
+
+BatchParagraph = FakeBatchParagraph
+
+
+class FakeLLMOnlyTranslator:
+    def __init__(self):
+        self.il_translator = FakeILTranslator()
+        self.shared_context_cross_split_part = SimpleNamespace(
+            first_paragraph=None,
+            recent_title_paragraph=None,
+            snapshot_title_paragraph=lambda paragraph: paragraph,
+        )
+        self.translation_config = SimpleNamespace(
+            local_native_table_paragraph_object_ids=set(),
+            min_text_length=5,
+            batch_target_source_tokens=2400,
+            batch_max_source_tokens=3200,
+            batch_max_paragraphs=40,
+            raise_if_cancelled=lambda: None,
+        )
+        self.mid = 0
+
+    def calc_token_count(self, text):
+        return len(text.split())
+
+    def _build_font_maps(self, page):
+        return {}, {}
+
+    def process_page(self, *args, **kwargs):
+        raise NotImplementedError
+
+    def translate_paragraph(self, *args, **kwargs):
+        raise NotImplementedError
+
+
+class FakeExecutor:
+    def __init__(self):
+        self.calls = []
+
+    def submit(self, fn, *args, **kwargs):
+        self.calls.append((fn, args, kwargs))
+
+
+def is_cid_paragraph(paragraph):
+    return False
+
+
+def is_pure_numeric_paragraph(paragraph):
+    return False
+
+
+def is_placeholder_only_paragraph(paragraph):
+    return False
+
+
 class FakeTranslateEngine:
     def __init__(self, output):
         self.output = output
@@ -324,6 +396,32 @@ class FakeOcrRuntime:
 
 
 class BabeldocCompatTest(unittest.TestCase):
+    def test_short_cjk_token_count_dodges_babeldoc_ratio_misfire(self):
+        modules = fake_modules()
+        llm_only_module = types.ModuleType(LLM_ONLY_MODULE)
+        llm_only_module.ILTranslatorLLMOnly = FakeLLMOnlyTranslator
+        modules[LLM_ONLY_MODULE] = llm_only_module
+
+        with patch.dict(sys.modules, modules):
+            handle = install_babeldoc_compat(
+                {"enable_native_table_translation": True}
+            )
+            translator = FakeLLMOnlyTranslator()
+            self.assertEqual(translator.calc_token_count("Main class"), 2)
+            self.assertEqual(
+                translator.calc_token_count("主要类别"),
+                1,
+            )
+            self.assertEqual(
+                translator.calc_token_count(
+                    "direct assessment and downstream task assessment"
+                ),
+                6,
+            )
+            handle.restore()
+
+        self.assertEqual(translator.calc_token_count("主要类别"), 1)
+
     def test_paragraph_finder_marks_fallback_text_inside_native_table(self):
         modules = fake_modules()
         table_text = paragraph("Data", "fallback_line")

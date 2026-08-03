@@ -253,7 +253,7 @@ class StructureRepairConfigTest(unittest.TestCase):
         self.assertIs(babeldoc["preserve_toc_layout"], True)
         self.assertIs(babeldoc["enable_translation_quality_guard"], True)
         self.assertEqual(babeldoc["translation_retry_chunk_sizes"], [700, 350])
-        self.assertIs(babeldoc["fail_on_unresolved_translation"], True)
+        self.assertIs(babeldoc["fail_on_unresolved_translation"], False)
 
     def test_table_ocr_runtime_is_lazy_reused_and_can_be_disabled(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

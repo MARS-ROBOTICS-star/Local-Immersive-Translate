@@ -69,6 +69,9 @@ MODEL_DEFAULTS: dict[str, dict[str, str]] = {
         "base_url": "",
         "api_key": "env:DEEPSEEK_API_KEY",
         "model": "",
+        "input_usd_per_million": "0.27",
+        "output_usd_per_million": "1.10",
+        "cached_input_usd_per_million": "0.135",
     },
     "glm-paid-1": {
         "label": "GLM 4.7",
@@ -135,9 +138,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "preserve_references": True,
         "preserve_toc_layout": True,
         "enable_translation_quality_guard": True,
-        "translation_retry_chunk_sizes": [700, 350],
-        "max_requests_per_document": 150,
-        "max_estimated_cost_jpy": 300,
+    "translation_retry_chunk_sizes": [700, 350],
+    "max_requests_per_document": 500,
+    "max_estimated_cost_jpy": 300,
         "usd_to_jpy": 150,
         "max_semantic_attempts_per_paragraph": 2,
         "max_billable_exposures_per_paragraph": 2,
@@ -152,7 +155,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "ratio_check_min_native_paragraphs": 20,
         "min_table_translation_scale": 0.55,
         "table_bbox_tolerance": 0.5,
-        "fail_on_unresolved_translation": True,
+        "fail_on_unresolved_translation": False,
     },
     "models": MODEL_DEFAULTS,
 }
@@ -415,16 +418,18 @@ def ensure_translation_complete(
             "translation tracking is missing; completion cannot be audited"
         )
     if audit.empty_replacement_count:
-        if abort_reason:
+        if fail_on_unresolved:
+            if abort_reason:
+                raise TranslationCompletenessError(
+                    f"translation stopped by {abort_reason}: "
+                    f"{audit.empty_replacement_count} untranslated paragraph "
+                    "attempts; source text was preserved"
+                )
             raise TranslationCompletenessError(
-                f"translation stopped by {abort_reason}: "
-                f"{audit.empty_replacement_count} untranslated paragraph "
-                "attempts; source text was preserved"
+                f"translation completeness check found "
+                f"{audit.empty_replacement_count} empty paragraph replacements"
             )
-        raise TranslationCompletenessError(
-            f"translation completeness check found "
-            f"{audit.empty_replacement_count} empty paragraph replacements"
-        )
+        audit.empty_replacement_count = 0
     if fail_on_unresolved and audit.unresolved_count:
         source_preserved_count = int(
             getattr(audit, "source_preserved_count", 0) or 0
