@@ -49,6 +49,26 @@ function Invoke-Checked {
   }
 }
 
+function Install-AgentSkill {
+  param(
+    [Parameter(Mandatory = $true)]
+    [string]$InstallDir
+  )
+
+  $skillSrc = Join-Path $InstallDir ".opencode\skills\zotero-translate-triage\SKILL.md"
+  $skillRoot = if ($env:OPENCODE_SKILLS_DIR) { $env:OPENCODE_SKILLS_DIR } else { Join-Path $env:USERPROFILE ".config\opencode\skills" }
+  $skillDir = Join-Path $skillRoot "zotero-translate-triage"
+  if (Test-Path -LiteralPath $skillSrc) {
+    New-Item -ItemType Directory -Force -Path $skillDir | Out-Null
+    Copy-Item -LiteralPath $skillSrc -Destination (Join-Path $skillDir "SKILL.md") -Force
+    Write-Host "Agent debugging skill installed to: $skillDir\SKILL.md"
+    Write-Host "Restart opencode (if running) for the skill to take effect."
+  }
+  else {
+    Write-Host "Skill file not found in $InstallDir; skipping agent skill installation."
+  }
+}
+
 function Invoke-CaptureChecked {
   param(
     [Parameter(Mandatory = $true)]
@@ -267,6 +287,8 @@ try {
   Invoke-Checked -FilePath "uv" -Arguments @("pip", "install", "--python", $babelDocPython, "-r", $backendRequirements)
   Invoke-Checked -FilePath $babelDocPython -Arguments @("-c", "from google import genai; assert genai is not None")
   Invoke-Checked -FilePath $babelDocPython -Arguments @("-c", "from rapidocr import RapidOCR; RapidOCR()")
+
+  Install-AgentSkill -InstallDir $InstallDir
 
   Write-Host ""
   Write-Host "Project directory: $InstallDir"

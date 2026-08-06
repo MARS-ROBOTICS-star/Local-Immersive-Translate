@@ -58,6 +58,39 @@ Local Immersive Translate v0.0.26 默认使用并锁定 BabelDOC v0.6.4。已有
 
 后端配置和调试说明见 [local_babeldoc_server/README.md](local_babeldoc_server/README.md)。
 
+## Agent 调试 Skill
+
+仓库内置了一个供 AI 编码助手（Agent）使用的排查 skill：`zotero-translate-triage`。翻译任务失败/卡住时，把任务 ID（32 位 hex）发给已安装该 skill 的 Agent，它会按固定流程快速筛查状态接口、usage 统计、工作目录、资源缓存和服务日志，直接定位失败原因（资源下载网络失败、模型 API 错误、请求额度耗尽等），并给出对应修复。
+
+- 本 skill 面向 opencode（也兼容 Claude Code / Codex 等支持 skill 的 Agent）。
+- 仓库内文件：`.opencode/skills/zotero-translate-triage/SKILL.md`。
+
+### 自动安装（推荐）
+
+在插件偏好设置点击 `安装/修复本地后端` 时，安装器会自动把该 skill 复制到本机 Agent 的 skill 目录，无需手动操作。重开 opencode（或其他 Agent）后即可使用。
+
+### 手动安装
+
+在任意目录执行以下命令之一：
+
+macOS/Linux:
+
+```bash
+mkdir -p ~/.config/opencode/skills
+cp .opencode/skills/zotero-translate-triage/SKILL.md ~/.config/opencode/skills/zotero-translate-triage/SKILL.md 2>/dev/null \
+  || curl -fsSL https://raw.githubusercontent.com/MARS-ROBOTICS-star/Local-Immersive-Translate/main/.opencode/skills/zotero-translate-triage/SKILL.md \
+     -o ~/.config/opencode/skills/zotero-translate-triage/SKILL.md
+```
+
+Windows PowerShell:
+
+```powershell
+New-Item -ItemType Directory -Force "$env:USERPROFILE\.config\opencode\skills\zotero-translate-triage" | Out-Null
+Copy-Item ".opencode\skills\zotero-translate-triage\SKILL.md" "$env:USERPROFILE\.config\opencode\skills\zotero-translate-triage\SKILL.md"
+```
+
+其他 Agent（如 Claude Code）对应目录：`~/.claude/skills/`（Linux/macOS）或 `%USERPROFILE%\.claude\skills\`（Windows）。如果安装器没有自动安装，也可以手动复制到对应目录。重启 Agent 后生效。
+
 ## 快捷键
 
 - `Ctrl+Shift+B`（macOS 为 `Cmd+Shift+B`）：翻译选中的文献。

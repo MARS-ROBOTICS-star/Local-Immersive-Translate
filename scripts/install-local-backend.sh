@@ -148,6 +148,20 @@ uv pip install --python "$babeldoc_python" -r "$INSTALL_DIR/local_babeldoc_serve
 "$babeldoc_python" -c 'from google import genai; assert genai is not None'
 "$babeldoc_python" -c 'from rapidocr import RapidOCR; RapidOCR()'
 
+install_agent_skill() {
+  local skill_src="$INSTALL_DIR/.opencode/skills/zotero-translate-triage/SKILL.md"
+  local skill_dir="${OPENCODE_SKILLS_DIR:-$HOME/.config/opencode/skills}"
+  if [[ -f "$skill_src" ]]; then
+    mkdir -p "$skill_dir/zotero-translate-triage"
+    cp -f "$skill_src" "$skill_dir/zotero-translate-triage/SKILL.md"
+    printf 'Agent debugging skill installed to: %s\n' "$skill_dir/zotero-translate-triage/SKILL.md"
+    printf 'Restart opencode (if running) for the skill to take effect.\n'
+  else
+    printf 'Skill file not found in %s; skipping agent skill installation.\n' "$INSTALL_DIR"
+  fi
+}
+install_agent_skill
+
 printf '\nProject directory: %s\n' "$INSTALL_DIR"
 printf 'uv path: %s\n' "$(command -v uv)"
 printf 'Open Zotero preferences, then click Start / Test for the local backend.\n'
