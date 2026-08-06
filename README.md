@@ -73,7 +73,7 @@ Local Immersive Translate v0.0.26 默认使用并锁定 BabelDOC v0.6.4。已有
 
 把下面这段文字**原样复制发给你的 Agent**（opencode / Claude Code / Codex 均可），它会自动完成下载和安装：
 
-> 请帮我安装 `zotero-translate-triage` 调试 skill：下载 <https://raw.githubusercontent.com/MARS-ROBOTICS-star/Local-Immersive-Translate/main/.opencode/skills/zotero-translate-triage/SKILL.md> 并保存到我的 Agent skill 目录（opencode 为 `~/.config/opencode/skills/zotero-translate-triage/SKILL.md`，Claude Code 为 `~/.claude/skills/zotero-translate-triage/SKILL.md`）。安装完成后告诉我需要重启哪个 Agent。
+> 请帮我安装 `zotero-translate-triage` 调试 skill：下载 <https://raw.githubusercontent.com/MARS-ROBOTICS-star/Local-Immersive-Translate/main/.opencode/skills/zotero-translate-triage/SKILL.md> 并保存到我的 Agent skill 目录（opencode 为 `~/.config/opencode/skills/zotero-translate-triage/SKILL.md`，Claude Code 为 `~/.claude/skills/zotero-translate-triage/SKILL.md`）。
 
 安装完成后重启 Agent 即可生效。
 
