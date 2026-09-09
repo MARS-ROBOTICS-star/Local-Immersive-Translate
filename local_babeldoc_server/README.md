@@ -2,7 +2,7 @@
 
 This folder contains the local backend used by the Zotero plugin. It exposes a Zotero-compatible API, runs BabelDOC on this machine, and returns translated PDF files to the plugin.
 
-Local Immersive Translate v0.0.26 uses and pins BabelDOC v0.6.4. Run the installer again, or click `Install / Repair Local Backend` in Zotero preferences, to update an existing checkout to the supported version.
+Local Immersive Translate v0.0.27 uses and pins BabelDOC v0.6.4. Run the installer again, or click `Install / Repair Local Backend` in Zotero preferences, to update an existing checkout to the supported version.
 
 The backend also applies structure-aware PDF repairs by default: native table
 text remains translatable, table regions without enough extractable text use

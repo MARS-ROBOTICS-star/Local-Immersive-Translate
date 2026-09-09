@@ -1,14 +1,14 @@
 # Local Immersive Translate for Zotero
 
-[![zotero target version](https://img.shields.io/badge/Zotero-7-green?style=flat-square&logo=zotero&logoColor=CC2936)](https://www.zotero.org)
+[![zotero target version](https://img.shields.io/badge/Zotero-7--10-green?style=flat-square&logo=zotero&logoColor=CC2936)](https://www.zotero.org)
 [![Using Zotero Plugin Template](https://img.shields.io/badge/Using-Zotero%20Plugin%20Template-blue?style=flat-square&logo=github)](https://github.com/windingwind/zotero-plugin-template)
 
-一个基于本地 BabelDOC 后端的 Zotero 7 PDF 翻译插件。
+一个兼容 Zotero 7 至 10、基于本地 BabelDOC 后端的 PDF 翻译插件。
 
-Local Immersive Translate 是面向 Zotero 7 的本地 PDF 翻译插件。插件通过本机 BabelDOC 后端处理 Zotero 文献 PDF，并把翻译结果导回 Zotero。
+Local Immersive Translate 是面向 Zotero 7 至 10 的本地 PDF 翻译插件。插件通过本机 BabelDOC 后端处理 Zotero 文献 PDF，并把翻译结果导回 Zotero。
 
 > [!NOTE]
-> 本插件基于 Zotero 7 开发，不兼容 Zotero 6。
+> 本插件兼容 Zotero 7 至 10，不兼容 Zotero 6。
 
 ## 安装
 
@@ -16,7 +16,7 @@ Local Immersive Translate 是面向 Zotero 7 的本地 PDF 翻译插件。插件
 
 1. 打开 Releases 页面：<https://github.com/MARS-ROBOTICS-star/Local-Immersive-Translate/releases>
 2. 下载最新版本的 `.xpi` 文件。
-3. 在 Zotero 7 中选择 `Tools` -> `Add-ons` -> `Install Add-on From File...`，选择刚下载的 `.xpi` 文件并安装。
+3. 在 Zotero 中选择 `Tools` -> `Add-ons` -> `Install Add-on From File...`，选择刚下载的 `.xpi` 文件并安装。
 4. 打开插件偏好设置，点击 `安装/修复本地后端`。插件会自动检查并安装本地后端所需环境和依赖。
 5. 在插件 GUI 中填写模型 API 地址、模型名和 API Key，然后点击 `Start / Test`。
 
@@ -47,7 +47,7 @@ powershell -ExecutionPolicy Bypass -File .\install.ps1
 
 本插件后端基于 [BabelDOC](https://github.com/funstory-ai/BabelDOC)。BabelDOC 负责 PDF 解析、版面保持和翻译文件生成，本项目提供 Zotero 插件界面、本地服务封装和跨平台安装脚本。
 
-Local Immersive Translate v0.0.26 默认使用并锁定 BabelDOC v0.6.4。已有安装可在插件偏好设置中再次点击 `安装/修复本地后端`，将本地 BabelDOC 更新到当前支持的版本。
+Local Immersive Translate v0.0.27 默认使用并锁定 BabelDOC v0.6.4。已有安装可在插件偏好设置中再次点击 `安装/修复本地后端`，将本地 BabelDOC 更新到当前支持的版本。
 
 默认安装路径：
 
