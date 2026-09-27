@@ -16,6 +16,7 @@ from local_babeldoc_server.translator_adapters import (
     UncontrolledBillableReasoningError,
 )
 from local_babeldoc_server.translator_adapters import resolve_adapter
+from local_babeldoc_server.translator_adapters import _classify_transport_error
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -48,6 +49,12 @@ class RecordingChatCompletions:
     def create(self, **kwargs):
         self.calls.append(kwargs)
         return self.response
+
+
+class HttpError(Exception):
+    def __init__(self, status_code: int, message: str) -> None:
+        super().__init__(message)
+        self.status_code = status_code
 
 
 def openai_response(*, usage=None):
@@ -85,6 +92,40 @@ MINIMAL_CAPABILITIES = ProviderCapabilities(
 
 
 class TranslatorAdaptersTest(unittest.TestCase):
+    def test_classifies_provider_failures_into_actionable_codes(self) -> None:
+        cases = (
+            (
+                HttpError(402, "Your prepayment credits are depleted"),
+                "model_credit_exhausted",
+                False,
+            ),
+            (
+                HttpError(400, "This API is not available in your current location"),
+                "model_region_unavailable",
+                False,
+            ),
+            (HttpError(401, "invalid key"), "model_auth_failed", False),
+            (HttpError(403, "permission denied"), "model_permission_denied", False),
+            (HttpError(404, "model missing"), "model_not_found", False),
+            (
+                HttpError(408, "request timeout"),
+                "transport_timeout_unknown_billing",
+                False,
+            ),
+            (
+                HttpError(429, "RESOURCE_EXHAUSTED: quota exceeded"),
+                "model_quota_exhausted",
+                True,
+            ),
+            (HttpError(502, "bad gateway"), "transport_unavailable", True),
+        )
+
+        for error, code, retryable in cases:
+            with self.subTest(code=code):
+                failure = _classify_transport_error(error)
+                self.assertEqual(failure.error_code, code)
+                self.assertIs(failure.retryable, retryable)
+
     def test_gemini_count_tokens_is_local_and_includes_schema(self) -> None:
         models = ExplodingTokenCounter()
         adapter = GeminiInteractionsAdapter(

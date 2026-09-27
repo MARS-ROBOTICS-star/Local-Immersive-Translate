@@ -62,6 +62,27 @@ class ReferenceStructureRulesTest(unittest.TestCase):
         self.assertEqual(appendix.layout_label, "title")
         self.assertIsNone(proof.layout_label)
 
+    def test_resumes_translation_at_reporting_summary(self):
+        reporting_summary = paragraph(
+            "Reporting Summary",
+            700,
+            720,
+            label="title",
+        )
+        checklist = paragraph("Nature Research reporting form", 660, 680)
+        doc = document(
+            [
+                paragraph("References", 700, 720, label="title"),
+                paragraph("1. A. Author, Paper", 660, 680),
+            ],
+            [reporting_summary, checklist],
+        )
+
+        mark_document_structure(doc)
+
+        self.assertEqual(reporting_summary.layout_label, "title")
+        self.assertIsNone(checklist.layout_label)
+
 
 class TocStructureRulesTest(unittest.TestCase):
     def test_parses_spaced_dot_leader(self):

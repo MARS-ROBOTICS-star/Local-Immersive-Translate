@@ -42,7 +42,7 @@ from local_babeldoc_server.pdf_output_quality import (
 
 DEFAULT_DATA_DIR = REPO_ROOT / ".local-babeldoc"
 DEFAULT_BABELDOC_REPO = REPO_ROOT / "BabelDOC"
-BACKEND_BUILD = "translation-runtime-safety-v1"
+BACKEND_BUILD = "translation-diagnostics-v2"
 
 GEMINI_STANDARD_PRICE_PROFILES: dict[str, tuple[str, str, str]] = {
     "gemini-3.6-flash": ("1.5", "7.5", "0.15"),
@@ -142,8 +142,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "max_requests_per_document": 500,
     "max_estimated_cost_jpy": 300,
         "usd_to_jpy": 150,
-        "max_semantic_attempts_per_paragraph": 2,
-        "max_billable_exposures_per_paragraph": 2,
+        "max_semantic_attempts_per_paragraph": 4,
+        "max_billable_exposures_per_paragraph": 4,
         "explicit_transport_retries": 1,
         "batch_target_source_tokens": 2400,
         "batch_max_source_tokens": 3200,
@@ -165,6 +165,309 @@ logger = logging.getLogger("local_babeldoc_server")
 
 class TranslationCompletenessError(RuntimeError):
     pass
+
+
+@dataclass(frozen=True, slots=True)
+class FailureDiagnostic:
+    code: str
+    category: str
+    reason: str
+    suggestion: str
+    retryable: bool
+    details: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "code": self.code,
+            "category": self.category,
+            "reason": self.reason,
+            "suggestion": self.suggestion,
+            "retryable": self.retryable,
+            "details": self.details,
+        }
+
+
+_FAILURE_GUIDANCE: dict[str, tuple[str, str, str, bool]] = {
+    "model_credit_exhausted": (
+        "model",
+        "The model account has no prepaid credits or available balance.",
+        "Add funds in the provider console or select another configured model, then retry.",
+        False,
+    ),
+    "model_region_unavailable": (
+        "model",
+        "The model API is unavailable from the current region or network route.",
+        "Start Zotero with a working proxy or select a provider available in this region, then retry.",
+        False,
+    ),
+    "model_auth_failed": (
+        "model",
+        "The model API rejected the configured API key.",
+        "Check the API key and provider configuration, run the model test, then retry.",
+        False,
+    ),
+    "model_permission_denied": (
+        "model",
+        "The API key or project does not have permission to use this model.",
+        "Enable model access or select an authorized model, then retry.",
+        False,
+    ),
+    "model_not_found": (
+        "model",
+        "The configured model or API endpoint was not found.",
+        "Check the model name, base URL, and API surface, then run the model test.",
+        False,
+    ),
+    "model_quota_exhausted": (
+        "model",
+        "The model account quota is exhausted.",
+        "Wait for the quota to reset, increase the quota, or select another model.",
+        True,
+    ),
+    "model_configuration_error": (
+        "model",
+        "The model rejected the request or its configuration is invalid.",
+        "Check the API URL, key, model name, region, and provider capabilities, then run the model test.",
+        False,
+    ),
+    "transport_rate_limited": (
+        "network",
+        "The model provider is rate limiting requests.",
+        "Wait briefly, reduce request concurrency or QPS, and retry.",
+        True,
+    ),
+    "transport_unavailable": (
+        "network",
+        "The model service is temporarily unavailable.",
+        "Check the provider status and network connection, then retry later.",
+        True,
+    ),
+    "transport_connection_failed": (
+        "network",
+        "The backend could not connect to the model service.",
+        "Check DNS, TLS, proxy settings, and the API base URL, then retry.",
+        True,
+    ),
+    "transport_connect_timeout": (
+        "network",
+        "Connecting to the model service timed out.",
+        "Check the network or proxy and retry.",
+        True,
+    ),
+    "transport_timeout_unknown_billing": (
+        "network",
+        "The model response timed out and billing status is unknown.",
+        "Check the provider console before retrying to avoid duplicate charges.",
+        True,
+    ),
+    "transport_unknown": (
+        "network",
+        "The model request failed with an unclassified transport error.",
+        "Check the provider bill and backend log, then verify the network, proxy, and API endpoint before retrying.",
+        True,
+    ),
+    "budget_request_limit": (
+        "safety",
+        "The document reached the maximum number of model requests.",
+        "Inspect repeated fallbacks, short table rows, and OCR duplication before increasing the request limit.",
+        False,
+    ),
+    "budget_cost_limit": (
+        "safety",
+        "The document reached the configured cost limit.",
+        "Review the usage summary, then raise the cost limit or use a lower-cost model if appropriate.",
+        False,
+    ),
+    "resource_download_failed": (
+        "resource",
+        "BabelDOC could not download or load a required model, font, CMap, or tokenizer asset.",
+        "Repair the BabelDOC cache with a working network or proxy, restart Zotero, and retry.",
+        True,
+    ),
+    "backend_dependency_missing": (
+        "backend",
+        "A required local backend dependency is missing.",
+        "Run the backend install/repair action, restart Zotero, and retry.",
+        False,
+    ),
+    "translation_incomplete": (
+        "quality",
+        "Too much translatable content is unresolved or empty.",
+        "Fix the preceding model, budget, or parsing error and start a new translation task.",
+        False,
+    ),
+    "pdf_output_invalid": (
+        "output",
+        "The generated PDF is missing, damaged, or failed the source-render integrity check.",
+        "Keep the original PDF, restart the backend, and retry after checking the service log.",
+        True,
+    ),
+    "ocr_safety_error": (
+        "quality",
+        "OCR or table reconstruction exceeded a safety threshold.",
+        "Disable table OCR for native-text PDFs or review the OCR safety settings before retrying.",
+        False,
+    ),
+    "audit_corrupt": (
+        "backend",
+        "The translation usage or tracking audit is incomplete or corrupt.",
+        "Restart Zotero and create a new translation task; inspect the working directory if it repeats.",
+        True,
+    ),
+    "uploaded_pdf_missing": (
+        "input",
+        "The uploaded source PDF is no longer available to the backend.",
+        "Create a new translation task from the original Zotero attachment.",
+        True,
+    ),
+    "translation_failed": (
+        "unknown",
+        "The translation failed for an unclassified reason.",
+        "Copy the task ID and inspect the backend status, usage summary, and service log.",
+        True,
+    ),
+}
+
+
+def _safe_failure_details(error: BaseException) -> str:
+    details = str(error).strip()
+    details = re.sub(
+        r"(?i)\b(bearer\s+)[A-Za-z0-9._~+/=-]+",
+        r"\1[redacted]",
+        details,
+    )
+    details = re.sub(
+        r"(?i)(\b(?:api[_ -]?key|access[_ -]?token|auth(?:orization)?|token|"
+        r"password|secret|key)"
+        r"\s*[=:]\s*)[^\s,;]+",
+        r"\1[redacted]",
+        details,
+    )
+    details = re.sub(
+        r"(?i)([?&](?:api[_-]?key|access_token|token|password|secret|key)=)"
+        r"[^&\s]+",
+        r"\1[redacted]",
+        details,
+    )
+    details = re.sub(
+        r"(?i)(https?://)[^/@\s:]+:[^/@\s]+@",
+        r"\1[redacted]@",
+        details,
+    )
+    details = re.sub(r"\bAIza[0-9A-Za-z_-]+\b", "[redacted]", details)
+    details = re.sub(r"\bsk-[0-9A-Za-z_-]+\b", "[redacted]", details)
+    return details[:1000]
+
+
+def diagnose_job_failure(error: BaseException) -> FailureDiagnostic:
+    details = _safe_failure_details(error)
+    text = details.casefold()
+    class_name = type(error).__name__.casefold()
+    status_code = getattr(error, "status_code", None)
+    if status_code is None:
+        status_code = getattr(getattr(error, "response", None), "status_code", None)
+    try:
+        status_code = int(status_code) if status_code is not None else None
+    except (TypeError, ValueError):
+        status_code = None
+
+    codes = tuple(_FAILURE_GUIDANCE)
+    code = next((item for item in codes if item in text), "")
+    if not code and status_code == 402:
+        code = "model_credit_exhausted"
+    elif not code and any(
+        marker in text
+        for marker in (
+            "prepayment credits are depleted",
+            "insufficient balance",
+            "payment required",
+        )
+    ):
+        code = "model_credit_exhausted"
+    elif not code and any(
+        marker in text
+        for marker in (
+            "not available in your current location",
+            "unsupported country",
+            "unsupported region",
+        )
+    ):
+        code = "model_region_unavailable"
+    elif not code and status_code == 401:
+        code = "model_auth_failed"
+    elif not code and status_code == 403:
+        code = "model_permission_denied"
+    elif not code and status_code == 404:
+        code = "model_not_found"
+    elif not code and status_code == 408:
+        code = "transport_timeout_unknown_billing"
+    elif not code and status_code == 429:
+        code = (
+            "model_quota_exhausted"
+            if "quota" in text or "resource_exhausted" in text
+            else "transport_rate_limited"
+        )
+    elif not code and status_code in {500, 502, 503, 504}:
+        code = "transport_unavailable"
+    elif not code and status_code is not None and 400 <= status_code < 500:
+        code = "model_configuration_error"
+    elif not code and (
+        "asset coroutine failed" in text
+        or "failed to download" in text
+        or "huggingface" in text
+        or any(asset in text for asset in ("cmap", "tiktoken"))
+    ):
+        code = "resource_download_failed"
+    elif not code and (
+        "translationcompletenesserror" in class_name
+        or "translation completeness" in text
+        or "translation tracking is missing" in text
+    ):
+        code = "translation_incomplete"
+    elif not code and (
+        "pdfoutputintegrityerror" in class_name
+        or "did not produce a translation" in text
+        or "did not produce a dual pdf" in text
+        or "source rendering audit failed" in text
+    ):
+        code = "pdf_output_invalid"
+    elif not code and (
+        "ocrsafetyerror" in class_name
+        or "tablelayoutsafetyerror" in class_name
+    ):
+        code = "ocr_safety_error"
+    elif not code and "auditcorruptionerror" in class_name:
+        code = "audit_corrupt"
+    elif not code and (
+        "google-genai" in text
+        or "rapidocr dependencies" in text
+        or "no module named" in text
+    ):
+        code = "backend_dependency_missing"
+    elif not code and "uploaded pdf not found" in text:
+        code = "uploaded_pdf_missing"
+    elif not code and (
+        "modelconfigurationerror" in class_name
+        or "model '" in text
+        and any(marker in text for marker in ("not configured", "is missing"))
+    ):
+        code = "model_configuration_error"
+    elif not code:
+        code = "translation_failed"
+
+    category, reason, suggestion, retryable = _FAILURE_GUIDANCE[code]
+    return FailureDiagnostic(
+        code=code,
+        category=category,
+        reason=reason,
+        suggestion=suggestion,
+        retryable=retryable,
+        details=details,
+    )
+
+
+def failure_message(diagnostic: FailureDiagnostic) -> str:
+    return f"[{diagnostic.code}] {diagnostic.reason} {diagnostic.suggestion}"
 
 
 @dataclass(frozen=True)
@@ -417,19 +720,26 @@ def ensure_translation_complete(
         raise TranslationCompletenessError(
             "translation tracking is missing; completion cannot be audited"
         )
+    attempted_count = int(getattr(audit, "attempted_count", 0) or 0)
+    accepted_count = int(getattr(audit, "accepted_count", 0) or 0)
+    unresolved_count = int(getattr(audit, "unresolved_count", 0) or 0)
+    if abort_reason and unresolved_count:
+        raise TranslationCompletenessError(
+            f"translation stopped by {abort_reason}: "
+            f"{unresolved_count} unresolved translatable paragraphs"
+        )
+    if attempted_count and not accepted_count and unresolved_count >= attempted_count:
+        raise TranslationCompletenessError(
+            "translation_incomplete: all attempted translations are unresolved"
+        )
     if audit.empty_replacement_count:
         if fail_on_unresolved:
-            if abort_reason:
-                raise TranslationCompletenessError(
-                    f"translation stopped by {abort_reason}: "
-                    f"{audit.empty_replacement_count} untranslated paragraph "
-                    "attempts; source text was preserved"
-                )
             raise TranslationCompletenessError(
                 f"translation completeness check found "
                 f"{audit.empty_replacement_count} empty paragraph replacements"
             )
-        audit.empty_replacement_count = 0
+    if not fail_on_unresolved:
+        return bool(audit.unresolved_count or audit.empty_replacement_count)
     if fail_on_unresolved and audit.unresolved_count:
         source_preserved_count = int(
             getattr(audit, "source_preserved_count", 0) or 0
@@ -474,6 +784,7 @@ class Job:
     progress: float = 0.0
     message: str = ""
     error: str = ""
+    diagnostic: dict[str, Any] | None = None
     translation_pdf_path: str = ""
     dual_pdf_path: str = ""
     total_seconds: float = 0.0
@@ -707,12 +1018,14 @@ class AppState:
                 self._run_babeldoc(pdf_id)
             except Exception as exc:
                 logger.exception("BabelDOC job failed: %s", pdf_id)
+                diagnostic = diagnose_job_failure(exc)
                 self.update_job(
                     pdf_id,
                     status="failed",
                     stage="failed",
-                    message=str(exc),
+                    message=failure_message(diagnostic),
                     error=traceback.format_exc(),
+                    diagnostic=diagnostic.to_dict(),
                 )
 
     def _get_doc_layout_model(self):
@@ -917,10 +1230,10 @@ class AppState:
             ),
             max_cost_usd=max_cost_usd,
             max_semantic_attempts_per_paragraph=int(
-                babeldoc_cfg.get("max_semantic_attempts_per_paragraph", 2)
+                babeldoc_cfg.get("max_semantic_attempts_per_paragraph", 4)
             ),
             max_billable_exposures_per_paragraph=int(
-                babeldoc_cfg.get("max_billable_exposures_per_paragraph", 2)
+                babeldoc_cfg.get("max_billable_exposures_per_paragraph", 4)
             ),
         )
         writer = TranslationAuditWriter(working_dir, pricing)
@@ -978,8 +1291,8 @@ class AppState:
                 "additionalProperties": False,
             },
         }
-        output = translator.do_translate(
-            "Hello.",
+        output = translator.do_llm_translate(
+            "Translate 'Hello.' and return it in the translation field.",
             rate_limit_params={
                 "document_id": job.pdf_id,
                 "request_category": "model_test",
@@ -987,6 +1300,10 @@ class AppState:
                 "max_output_tokens": 128,
             },
         )
+        if output is None:
+            raise RuntimeError(
+                f"model '{model_key}' returned an empty response during test"
+            )
         try:
             payload = json.loads(output)
         except json.JSONDecodeError as error:
@@ -1319,21 +1636,21 @@ class LocalBabelDOCHandler(BaseHTTPRequestHandler):
             self._handle_get()
         except Exception as exc:
             logger.exception("GET failed: %s", self.path)
-            self._send_error(HTTPStatus.INTERNAL_SERVER_ERROR, str(exc))
+            self._send_exception(HTTPStatus.INTERNAL_SERVER_ERROR, exc)
 
     def do_POST(self) -> None:
         try:
             self._handle_post()
         except Exception as exc:
             logger.exception("POST failed: %s", self.path)
-            self._send_error(HTTPStatus.INTERNAL_SERVER_ERROR, str(exc))
+            self._send_exception(HTTPStatus.INTERNAL_SERVER_ERROR, exc)
 
     def do_PUT(self) -> None:
         try:
             self._handle_put()
         except Exception as exc:
             logger.exception("PUT failed: %s", self.path)
-            self._send_error(HTTPStatus.INTERNAL_SERVER_ERROR, str(exc))
+            self._send_exception(HTTPStatus.INTERNAL_SERVER_ERROR, exc)
 
     def log_message(self, fmt, *args) -> None:
         logger.debug("%s - %s", self.address_string(), fmt % args)
@@ -1511,6 +1828,7 @@ class LocalBabelDOCHandler(BaseHTTPRequestHandler):
                 "currentStageName": job.stage,
                 "status": status,
                 "message": job.message,
+                "diagnostic": job.diagnostic,
                 "num_pages": 0,
             }
         )
@@ -1601,6 +1919,17 @@ class LocalBabelDOCHandler(BaseHTTPRequestHandler):
 
     def _send_error(self, status: int, message: str) -> None:
         self._send_json(status, {"code": 1, "message": message})
+
+    def _send_exception(self, status: int, error: BaseException) -> None:
+        diagnostic = diagnose_job_failure(error)
+        self._send_json(
+            status,
+            {
+                "code": 1,
+                "message": failure_message(diagnostic),
+                "diagnostic": diagnostic.to_dict(),
+            },
+        )
 
 
 def parse_args() -> argparse.Namespace:

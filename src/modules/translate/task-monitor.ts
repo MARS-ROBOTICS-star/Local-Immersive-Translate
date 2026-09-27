@@ -4,6 +4,7 @@ import { updateTaskInList } from "./task-manager";
 import { checkIsCN } from "../../utils/cn";
 import { getString } from "../../utils/locale";
 import { isLocalBackendEnabled } from "../../api/request";
+import { buildTranslationFailure, showTranslationFailure } from "./diagnostics";
 
 const ATTR_TAG = "BabelDOC_translated";
 
@@ -123,10 +124,17 @@ export const TranslationTaskMonitor = {
             `ERROR: Failed to download result for ${pdfId} (${attachmentFilename}):`,
             downloadError.message || downloadError,
           );
+          const failure = buildTranslationFailure({
+            fallback: downloadError.message || "Failed to download result",
+            phase: "download",
+            pdfId,
+          });
           updateTaskInList(attachmentId, {
             status: "failed",
-            error: downloadError.message || "Failed to download result",
+            error: failure.message,
+            diagnostic: failure.diagnostic,
           });
+          showTranslationFailure(failure.message);
           // Remove failed task from monitor
           this.activeTasks.delete(pdfId);
         }
@@ -139,14 +147,24 @@ export const TranslationTaskMonitor = {
         processStatus.status !== "" &&
         processStatus.status !== "ok"
       ) {
-        const errorMsg = `Translation failed with status: ${processStatus.status}`;
+        const failure = buildTranslationFailure({
+          diagnostic: processStatus.diagnostic,
+          fallback:
+            processStatus.message ||
+            `Translation failed with status: ${processStatus.status}`,
+          phase: "translation",
+          pdfId,
+        });
         ztoolkit.log(
-          `ERROR: ${errorMsg} for PDF ID: ${pdfId} (${attachmentFilename}).`,
+          `ERROR: ${failure.message} for PDF ID: ${pdfId} (${attachmentFilename}).`,
         );
         updateTaskInList(attachmentId, {
           status: "failed",
-          error: processStatus.message,
+          stage: "failed",
+          error: failure.message,
+          diagnostic: failure.diagnostic,
         });
+        showTranslationFailure(failure.message);
         // Remove failed task from monitor
         this.activeTasks.delete(pdfId);
       }
@@ -159,10 +177,18 @@ export const TranslationTaskMonitor = {
           error.message || error,
         );
 
+        const failure = buildTranslationFailure({
+          fallback: error.message || "Error checking translation status",
+          phase: "poll",
+          pdfId,
+        });
         updateTaskInList(taskInfo.taskData.attachmentId, {
           status: "failed",
-          error: error.message || "Error checking translation status",
+          stage: "failed",
+          error: failure.message,
+          diagnostic: failure.diagnostic,
         });
+        showTranslationFailure(failure.message);
       }
       // Remove failed task from monitor
       this.activeTasks.delete(pdfId);
@@ -252,12 +278,18 @@ async function downloadTranslateResult({
       error.message || error,
     );
     // 更新任务状态为下载失败
+    const failure = buildTranslationFailure({
+      fallback: error.message || getString("download-failed"),
+      phase: "download",
+      pdfId,
+    });
     updateTaskInList(taskData.attachmentId, {
       status: "failed",
       stage: getString("download-failed"),
-      error: error.message || getString("download-failed"),
+      error: failure.message,
+      diagnostic: failure.diagnostic,
     });
-    throw error;
+    throw new Error(failure.message);
   }
 }
 

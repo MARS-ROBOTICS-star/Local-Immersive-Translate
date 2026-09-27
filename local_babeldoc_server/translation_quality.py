@@ -12,7 +12,10 @@ _URL_RE = re.compile(r"https?://[^\s<>\"'，。]+", re.IGNORECASE)
 _DOI_RE = re.compile(r"10\.\d{4,9}/[-._;()/:A-Z0-9]+", re.IGNORECASE)
 _CITATION_RE = re.compile(r"\[\s*\d+(?:\s*[-–—]\s*\d+)?\s*]")
 _NUMBER_RE = re.compile(
-    r"(?<![A-Za-z])\d+(?:\.\d+)?%?(?![A-Za-z]|[-‐‑–—][A-Za-z])"
+    r"(?<![\dA-Za-z])(?:"
+    r"\d+(?:\.\d+)?%(?!\d)|"
+    r"\d+(?:\.\d+)?(?![%\dA-Za-z]|[-‐‑–—][A-Za-z])"
+    r")"
 )
 _SENTENCE_BREAK_RE = re.compile(r"(?<=[.!?。！？])\s+")
 _TERMINAL_PUNCTUATION_RE = re.compile(r"[.!?。！？][\"'’”）)】\]]*$")

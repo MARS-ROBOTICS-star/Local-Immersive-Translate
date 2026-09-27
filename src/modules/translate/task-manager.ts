@@ -2,7 +2,11 @@ import { isWindowAlive } from "../../utils/window";
 import { config } from "../../../package.json";
 import { getString } from "../../utils/locale";
 import { saveTranslationData } from "./persistence";
-import { Status, TranslationTaskData } from "../../types";
+import {
+  Status,
+  TranslationFailureDiagnostic,
+  TranslationTaskData,
+} from "../../types";
 import { getTranslateModeLabel, getTranslateModelLabel } from "../../config";
 import { Language } from "../language/types";
 import { getLanguageName } from "../language";
@@ -184,10 +188,17 @@ export async function showTaskManager() {
       if (tasks.length > 0) {
         const task = tasks[0];
         if (task.status === "failed") {
-          // Update task status to queued
-          updateTaskInList(task.attachmentId, {
+          const retryTask: TranslationTaskData = {
+            ...task,
+            status: "queued",
+            stage: "queued",
+            progress: 0,
+            pdfId: undefined,
             error: "",
-          });
+            diagnostic: undefined,
+            resultAttachmentId: undefined,
+          };
+          updateTaskInList(task.attachmentId, retryTask);
 
           // Add back to the global queue if not already there
           if (
@@ -195,7 +206,7 @@ export async function showTaskManager() {
               (t) => t.attachmentId === task.attachmentId,
             )
           ) {
-            addon.data.task.translationGlobalQueue.unshift(task);
+            addon.data.task.translationGlobalQueue.unshift(retryTask);
           }
 
           startQueueProcessing();
@@ -294,6 +305,7 @@ export function updateTaskInList(
     progress?: number;
     resultAttachmentId?: number;
     error?: string;
+    diagnostic?: TranslationFailureDiagnostic;
   },
 ) {
   if (!addon.data.task.translationTaskList) return;
@@ -390,6 +402,7 @@ function getStageText(stage?: string) {
     uploading: getString("task-stage-uploading"),
     downloading: getString("task-stage-downloading"),
     completed: getString("task-stage-completed"),
+    failed: getString("task-stage-failed"),
     "Parse PDF and Create Intermediate Representation": getString(
       "task-stage-parse-pdf",
     ),

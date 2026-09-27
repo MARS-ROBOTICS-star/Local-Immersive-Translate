@@ -1,5 +1,6 @@
 import { request } from "./request";
 import type { LocalModelConfig } from "../utils/local-model-config";
+import type { TranslationFailureDiagnostic } from "../types";
 
 export function checkAuthKey(params: { apiKey: string }): Promise<boolean> {
   return request({
@@ -155,6 +156,7 @@ type GetTranslateStatusResponse = {
   currentStageName: string;
   status: string;
   message: string;
+  diagnostic?: TranslationFailureDiagnostic | null;
   num_pages: number;
 };
 

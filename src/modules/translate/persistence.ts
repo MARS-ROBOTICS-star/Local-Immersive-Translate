@@ -146,9 +146,7 @@ export function saveTranslationData() {
       addon.data.task.translationTaskList
         .filter(
           (task: any) =>
-            task.status !== "success" &&
-            task.status !== "failed" &&
-            task.status !== "canceled",
+            task.status !== "success" && task.status !== "canceled",
         )
         .forEach((task: TranslationTaskData) => setTask(task));
     }

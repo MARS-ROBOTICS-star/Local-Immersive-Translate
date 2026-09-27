@@ -10,6 +10,15 @@ export type Status =
 
 export type Stage = "queued" | "processing" | "success" | "failed";
 
+export type TranslationFailureDiagnostic = {
+  code: string;
+  category: string;
+  reason: string;
+  suggestion: string;
+  retryable: boolean;
+  details?: string;
+};
+
 export type TranslationTaskData = {
   parentItemId?: number;
   parentItemTitle?: string;
@@ -24,5 +33,6 @@ export type TranslationTaskData = {
   stage?: string;
   progress?: number;
   error?: string;
+  diagnostic?: TranslationFailureDiagnostic;
   resultAttachmentId?: number;
 };

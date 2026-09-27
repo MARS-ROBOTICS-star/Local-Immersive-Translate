@@ -16,9 +16,11 @@ from local_babeldoc_server.pdf_output_quality import PdfOutputIntegrityError
 from local_babeldoc_server.server import AppState
 from local_babeldoc_server.server import Job
 from local_babeldoc_server.server import LocalBabelDOCHandler
+from local_babeldoc_server.server import TranslationAudit
 from local_babeldoc_server.server import TranslationCompletenessError
 from local_babeldoc_server.server import audit_translation_completion
 from local_babeldoc_server.server import ensure_translation_complete
+from local_babeldoc_server.server import diagnose_job_failure
 from local_babeldoc_server.server import load_config
 from local_babeldoc_server.server import find_zotero_ancestor
 from local_babeldoc_server.server import is_watched_process_alive
@@ -178,7 +180,7 @@ class ServerEntrypointTest(unittest.TestCase):
         self.assertEqual(sent[0][1]["status"], "ok")
         self.assertEqual(
             sent[0][1]["backend_build"],
-            "translation-runtime-safety-v1",
+            "translation-diagnostics-v2",
         )
 
     def test_direct_script_start_works_outside_project_directory(self) -> None:
@@ -241,6 +243,106 @@ class AppStateRecoveryTest(unittest.TestCase):
             self.assertEqual(job.translation_pdf_path, str(mono_path))
             self.assertEqual(job.dual_pdf_path, str(dual_path))
             self.assertIs(state.get_job(pdf_id), job)
+
+
+class FailureDiagnosticTest(unittest.TestCase):
+    def test_region_message_takes_precedence_over_generic_http_400(self) -> None:
+        error = RuntimeError("This API is not available in your current location")
+        error.status_code = 400
+
+        diagnostic = diagnose_job_failure(error)
+
+        self.assertEqual(diagnostic.code, "model_region_unavailable")
+
+    def test_failure_details_redact_common_credentials(self) -> None:
+        diagnostic = diagnose_job_failure(
+            RuntimeError(
+                "Authorization: Bearer secret-token; "
+                "secret=config-secret; "
+                "url=https://user:password@example.com/path?token=query-secret"
+            )
+        )
+
+        self.assertNotIn("secret-token", diagnostic.details)
+        self.assertNotIn("config-secret", diagnostic.details)
+        self.assertNotIn("password", diagnostic.details)
+        self.assertNotIn("query-secret", diagnostic.details)
+        self.assertIn("[redacted]", diagnostic.details)
+
+    def test_http_status_is_used_when_provider_message_is_ambiguous(self) -> None:
+        error = RuntimeError("provider request failed")
+        error.status_code = 402
+
+        diagnostic = diagnose_job_failure(error)
+
+        self.assertEqual(diagnostic.code, "model_credit_exhausted")
+        self.assertFalse(diagnostic.retryable)
+
+    def test_credit_exhaustion_has_actionable_diagnostic(self) -> None:
+        diagnostic = diagnose_job_failure(
+            RuntimeError(
+                "Error code: 402 - Your prepayment credits are depleted. "
+                "status: RESOURCE_EXHAUSTED"
+            )
+        )
+
+        self.assertEqual(diagnostic.code, "model_credit_exhausted")
+        self.assertEqual(diagnostic.category, "model")
+        self.assertFalse(diagnostic.retryable)
+        self.assertIn("Add funds", diagnostic.suggestion)
+
+    def test_job_failure_exposes_structured_diagnostic(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = AppState(make_config(Path(temp_dir)))
+            job = Job(
+                pdf_id="failed-job",
+                object_key="source.pdf",
+                file_name="source.pdf",
+                request_model="gemini-1",
+                target_language="zh-CN",
+                model_config=None,
+                options={},
+                created_at=1.0,
+            )
+            state.add_job(job)
+
+            with patch.object(
+                state,
+                "_run_babeldoc",
+                side_effect=RuntimeError(
+                    "model_credit_exhausted: payment required"
+                ),
+            ):
+                state._run_job_thread(job.pdf_id)
+
+        self.assertEqual(job.status, "failed")
+        self.assertEqual(job.diagnostic["code"], "model_credit_exhausted")
+        self.assertIn("model_credit_exhausted", job.message)
+
+    def test_process_status_returns_diagnostic(self) -> None:
+        handler = LocalBabelDOCHandler.__new__(LocalBabelDOCHandler)
+        job = SimpleNamespace(
+            status="failed",
+            progress=12.0,
+            stage="failed",
+            message="failed",
+            diagnostic={"code": "model_auth_failed"},
+        )
+        handler.server = SimpleNamespace(
+            state=SimpleNamespace(
+                get_job_or_recover_finished=lambda _pdf_id: job
+            )
+        )
+        sent = []
+        handler._send_ok = sent.append
+
+        handler._send_process_status("failed-job")
+
+        self.assertEqual(sent[0]["status"], "failed")
+        self.assertEqual(
+            sent[0]["diagnostic"],
+            {"code": "model_auth_failed"},
+        )
 
 
 class StructureRepairConfigTest(unittest.TestCase):
@@ -464,6 +566,23 @@ class AppStateOutputIntegrityTest(unittest.TestCase):
 
 
 class TranslationCompletionAuditTest(unittest.TestCase):
+    def test_frozen_audit_with_unresolved_items_is_deliverable_warning(self) -> None:
+        audit = TranslationAudit(
+            attempted_count=929,
+            accepted_count=924,
+            unresolved_count=5,
+            source_preserved_count=4,
+            empty_replacement_count=1,
+        )
+
+        result = ensure_translation_complete(
+            audit,
+            fail_on_unresolved=False,
+        )
+
+        self.assertIs(result, True)
+        self.assertEqual(audit.empty_replacement_count, 1)
+
     def test_one_source_preserved_item_in_large_document_is_deliverable_warning(self) -> None:
         audit = SimpleNamespace(
             tracking_missing=False,
@@ -633,6 +752,8 @@ class TranslationCompletionAuditTest(unittest.TestCase):
     def test_request_budget_failure_reports_preserved_source_text(self) -> None:
         audit = SimpleNamespace(
             tracking_missing=False,
+            attempted_count=260,
+            accepted_count=0,
             unresolved_count=260,
             empty_replacement_count=260,
             protected_token_mismatch_count=0,
@@ -640,13 +761,29 @@ class TranslationCompletionAuditTest(unittest.TestCase):
 
         with self.assertRaisesRegex(
             TranslationCompletenessError,
-            "budget_request_limit.*260 untranslated.*source text was preserved",
+            "budget_request_limit.*260 unresolved",
         ):
             ensure_translation_complete(
                 audit,
                 fail_on_unresolved=True,
                 abort_reason="budget_request_limit",
             )
+
+    def test_all_empty_translation_fails_even_when_warnings_are_allowed(self) -> None:
+        audit = SimpleNamespace(
+            tracking_missing=False,
+            attempted_count=650,
+            accepted_count=0,
+            unresolved_count=650,
+            empty_replacement_count=650,
+            protected_token_mismatch_count=0,
+        )
+
+        with self.assertRaisesRegex(
+            TranslationCompletenessError,
+            "all attempted translations are unresolved",
+        ):
+            ensure_translation_complete(audit, fail_on_unresolved=False)
 
 
 class InstallerVersionTest(unittest.TestCase):

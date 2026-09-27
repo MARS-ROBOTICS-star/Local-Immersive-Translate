@@ -11,6 +11,7 @@ import { Language } from "../language/types";
 import { report } from "../../utils/report";
 import { normalizeTranslateModel } from "../../config";
 import { ensureLocalBackendRunning } from "../local-backend";
+import { buildTranslationFailure, showTranslationFailure } from "./diagnostics";
 
 const ATTR_TAG = "BabelDOC_translated";
 
@@ -392,10 +393,18 @@ async function processNextItem() {
       `ERROR: Failed to initiate translation for ${taskData.attachmentFilename}:`,
       error.message || error,
     );
+    const failure = buildTranslationFailure({
+      fallback: error.message || String(error),
+      phase: "upload",
+      pdfId: taskData.pdfId,
+    });
     updateTaskInList(taskData.attachmentId, {
       status: "failed",
-      error: error.message || error,
+      stage: "failed",
+      error: failure.message,
+      diagnostic: failure.diagnostic,
     });
+    showTranslationFailure(failure.message);
   } finally {
     Zotero.Promise.delay(0).then(processNextItem);
   }

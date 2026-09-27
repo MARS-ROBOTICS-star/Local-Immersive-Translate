@@ -74,14 +74,81 @@ def _classify_transport_error(error: Exception) -> TransportFailure:
     if status_code is None:
         response = getattr(error, "response", None)
         status_code = getattr(response, "status_code", None)
+    try:
+        status_code = int(status_code) if status_code is not None else None
+    except (TypeError, ValueError):
+        status_code = None
+    message = str(error).casefold()
+    if status_code == 402 or any(
+        marker in message
+        for marker in (
+            "prepayment credits are depleted",
+            "insufficient balance",
+            "payment required",
+        )
+    ):
+        return TransportFailure(
+            outcome=TransportOutcome.CLIENT_ERROR,
+            billing_status=BillingStatus.NOT_BILLABLE,
+            retryable=False,
+            error_code="model_credit_exhausted",
+        )
+    if any(
+        marker in message
+        for marker in (
+            "not available in your current location",
+            "location is not supported",
+            "unsupported country",
+            "unsupported region",
+        )
+    ):
+        return TransportFailure(
+            outcome=TransportOutcome.CLIENT_ERROR,
+            billing_status=BillingStatus.NOT_BILLABLE,
+            retryable=False,
+            error_code="model_region_unavailable",
+        )
+    if status_code == 401:
+        return TransportFailure(
+            outcome=TransportOutcome.CLIENT_ERROR,
+            billing_status=BillingStatus.NOT_BILLABLE,
+            retryable=False,
+            error_code="model_auth_failed",
+        )
+    if status_code == 403:
+        return TransportFailure(
+            outcome=TransportOutcome.CLIENT_ERROR,
+            billing_status=BillingStatus.NOT_BILLABLE,
+            retryable=False,
+            error_code="model_permission_denied",
+        )
+    if status_code == 404:
+        return TransportFailure(
+            outcome=TransportOutcome.CLIENT_ERROR,
+            billing_status=BillingStatus.NOT_BILLABLE,
+            retryable=False,
+            error_code="model_not_found",
+        )
+    if status_code == 408:
+        return TransportFailure(
+            outcome=TransportOutcome.RESPONSE_TIMEOUT,
+            billing_status=BillingStatus.UNKNOWN,
+            retryable=False,
+            error_code="transport_timeout_unknown_billing",
+        )
     if status_code == 429:
+        error_code = (
+            "model_quota_exhausted"
+            if "quota" in message or "resource_exhausted" in message
+            else "transport_rate_limited"
+        )
         return TransportFailure(
             outcome=TransportOutcome.RATE_LIMITED,
             billing_status=BillingStatus.NOT_BILLABLE,
             retryable=True,
-            error_code="transport_rate_limited",
+            error_code=error_code,
         )
-    if status_code == 503:
+    if status_code in {500, 502, 503, 504}:
         return TransportFailure(
             outcome=TransportOutcome.UNAVAILABLE,
             billing_status=BillingStatus.NOT_BILLABLE,
@@ -95,6 +162,24 @@ def _classify_transport_error(error: Exception) -> TransportFailure:
             billing_status=BillingStatus.NOT_BILLABLE,
             retryable=False,
             error_code="transport_connect_timeout",
+        )
+    if any(
+        marker in name or marker in message
+        for marker in (
+            "connecterror",
+            "connectionerror",
+            "connection refused",
+            "name or service not known",
+            "temporary failure in name resolution",
+            "proxyerror",
+            "sslerror",
+        )
+    ):
+        return TransportFailure(
+            outcome=TransportOutcome.UNAVAILABLE,
+            billing_status=BillingStatus.NOT_BILLABLE,
+            retryable=True,
+            error_code="transport_connection_failed",
         )
     if "readtimeout" in name or "timeout" in name:
         return TransportFailure(

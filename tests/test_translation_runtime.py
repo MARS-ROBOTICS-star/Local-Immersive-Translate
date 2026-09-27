@@ -56,6 +56,10 @@ class FakeReadTimeout(Exception):
     pass
 
 
+class FakeCreditExhausted(Exception):
+    pass
+
+
 class FakeAdapter:
     model = "fake-model"
     capabilities = CAPABILITIES
@@ -105,6 +109,16 @@ class FakeAdapter:
 class RejectingAdapter(FakeAdapter):
     def validate_request(self, request):
         raise ModelConfigurationError("strict schema unsupported")
+
+
+class CreditExhaustedAdapter(FakeAdapter):
+    def classify_error(self, error):
+        return TransportFailure(
+            outcome=TransportOutcome.CLIENT_ERROR,
+            billing_status=BillingStatus.NOT_BILLABLE,
+            retryable=False,
+            error_code="model_credit_exhausted",
+        )
 
 
 def response(text="译文"):
@@ -237,6 +251,33 @@ class TranslationRuntimeTest(unittest.TestCase):
             self.assertEqual(adapter.send_count, 0)
             self.assertFalse(writer.jsonl_path.exists())
 
+    def test_remote_configuration_failure_aborts_document_after_one_request(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            adapter = CreditExhaustedAdapter([FakeCreditExhausted("HTTP 402")])
+            runtime, budget, writer = self.make_runtime(directory, adapter)
+
+            with self.assertRaises(FakeCreditExhausted):
+                runtime.request(
+                    context(),
+                    AdapterRequest(model="fake-model", input="translate"),
+                )
+
+            self.assertEqual(adapter.send_count, 1)
+            self.assertEqual(
+                budget.snapshot().abort_reason,
+                "model_credit_exhausted",
+            )
+            with self.assertRaises(BudgetExceeded):
+                runtime.request(
+                    context(),
+                    AdapterRequest(model="fake-model", input="translate again"),
+                )
+            self.assertEqual(adapter.send_count, 1)
+            record = json.loads(
+                writer.jsonl_path.read_text(encoding="utf-8").splitlines()[0]
+            )
+            self.assertEqual(record["error_code"], "model_credit_exhausted")
+
     def test_aborted_runtime_refuses_adapter_send(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             adapter = FakeAdapter([response()])
@@ -325,6 +366,8 @@ class TranslationRuntimeTest(unittest.TestCase):
                 "Preserve every number and unit exactly as written",
                 sent_prompt,
             )
+            self.assertIn("Return only translated plain text", sent_prompt)
+            self.assertNotIn("JSON format", sent_prompt)
 
     def test_terminology_translator_uses_its_own_category_without_paragraph_attempts(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

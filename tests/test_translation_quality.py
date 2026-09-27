@@ -91,6 +91,22 @@ class TranslationValidationTest(unittest.TestCase):
 
         self.assertTrue(result.accepted, result.reasons)
 
+    def test_does_not_match_partial_number_inside_hyphenated_term(self) -> None:
+        source = "Culture organoids in a 12-well plate with a P1000 pipette."
+        target = "使用 P1000 移液器在 12 孔板中培养类器官。"
+
+        result = validate_translation(source, target, "zh")
+
+        self.assertTrue(result.accepted, result.reasons)
+
+    def test_keeps_percentage_attached_to_following_unit_name(self) -> None:
+        source = "Dissolve it in 100%EtOH with 1%vol/vol supplement."
+        target = "将其溶于 100% EtOH，并加入 1% vol/vol 补充剂。"
+
+        result = validate_translation(source, target, "zh")
+
+        self.assertTrue(result.accepted, result.reasons)
+
 
 class TranslationChunkingTest(unittest.TestCase):
     def test_splits_at_sentence_boundaries_without_losing_or_reordering_text(self) -> None:

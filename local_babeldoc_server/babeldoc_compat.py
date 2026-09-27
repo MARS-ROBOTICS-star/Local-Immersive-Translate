@@ -23,6 +23,7 @@ from local_babeldoc_server.structure_rules import display_width
 from local_babeldoc_server.structure_rules import mark_document_structure
 from local_babeldoc_server.structure_rules import parse_toc_entry
 from local_babeldoc_server.structure_rules import rebuild_toc_entry
+from local_babeldoc_server.translation_budget import AttemptLimitExceeded
 from local_babeldoc_server.translation_quality import validate_translation
 from local_babeldoc_server.translation_quality import split_translation_chunks
 from local_babeldoc_server.translation_batching import partition_batch_indices
@@ -529,8 +530,16 @@ def inject_ocr_table_paragraphs(
     table_regions = 0
     ocr_table_regions = 0
     ocr_text_blocks = 0
+    duplicate_ocr_blocks = 0
 
     for page in getattr(document, "page", []):
+        native_regions = []
+        for paragraph in getattr(page, "pdf_paragraph", []):
+            label = str(getattr(paragraph, "layout_label", "") or "").casefold()
+            text = str(getattr(paragraph, "unicode", "") or "").strip()
+            bbox = _paragraph_bbox(paragraph)
+            if "ocr" not in label and text and bbox is not None:
+                native_regions.append(OcrRegion(text=text, bbox=bbox))
         table_layouts = [
             layout
             for layout in getattr(page, "page_layout", [])
@@ -551,8 +560,23 @@ def inject_ocr_table_paragraphs(
             blocks = runtime.extract(mupdf_document[page.page_number], layout.box)
             if not blocks:
                 continue
-            ocr_table_regions += 1
+            injected_region = False
             for block_index, block in enumerate(blocks):
+                ocr_region = OcrRegion(
+                    text=block.text,
+                    bbox=(
+                        block.pdf_box.x,
+                        block.pdf_box.y,
+                        block.pdf_box.x2,
+                        block.pdf_box.y2,
+                    ),
+                )
+                if any(
+                    is_duplicate_text_region(native_region, ocr_region)
+                    for native_region in native_regions
+                ):
+                    duplicate_ocr_blocks += 1
+                    continue
                 debug_id = (
                     f"local-table-ocr-{page.page_number}-{table_index}-{block_index}"
                 )
@@ -561,6 +585,15 @@ def inject_ocr_table_paragraphs(
                 )
                 page.pdf_rectangle.append(_make_ocr_background(il_version, block))
                 ocr_text_blocks += 1
+                injected_region = True
+            if injected_region:
+                ocr_table_regions += 1
+
+    if duplicate_ocr_blocks:
+        logger.info(
+            "Skipped %s table OCR blocks already present as native text",
+            duplicate_ocr_blocks,
+        )
 
     return TableStats(
         table_regions=table_regions,
@@ -1235,21 +1268,11 @@ def install_babeldoc_compat(
             if registry is not None
             else None
         )
-        if (
+        source_preserved = (
             stable_id is not None
             and callable(outcome_getter)
             and outcome_getter(stable_id) == "source_preserved"
-        ):
-            _call_tracker(tracker, "set_output", source_text)
-            _record_quality_event(
-                self.translation_config,
-                "unresolved",
-                paragraph,
-                source_text,
-                ("source_preserved_after_two_attempts",),
-                source_preserved=True,
-            )
-            return False
+        )
         target_language = getattr(
             getattr(self, "translation_config", None),
             "lang_out",
@@ -1267,38 +1290,61 @@ def install_babeldoc_compat(
                 lambda: False,
             )
             if batch_context_active():
-                with _paragraph_translation_context(
+                fallback_attempts = 2 if source_preserved else 1
+                for _ in range(fallback_attempts):
+                    try:
+                        with _paragraph_translation_context(
+                            self,
+                            paragraph,
+                            "fallback",
+                        ):
+                            fallback_text = translate_engine.translate(
+                                source_text,
+                                ignore_cache=True,
+                                rate_limit_params={
+                                    "paragraph_token_count": len(source_text),
+                                },
+                            )
+                    except AttemptLimitExceeded:
+                        if not source_preserved:
+                            raise
+                        break
+                    fallback_validation = validate_translation(
+                        source_text,
+                        fallback_text,
+                        target_language,
+                    )
+                    if fallback_validation.accepted:
+                        _record_quality_event(
+                            self.translation_config,
+                            "recovered",
+                            paragraph,
+                            source_text,
+                        )
+                        return original_post_translate(
+                            self,
+                            paragraph,
+                            tracker,
+                            translate_input,
+                            fallback_text,
+                        )
+                    validation = fallback_validation
+            if source_preserved:
+                _record_quality_event(
+                    self.translation_config,
+                    "unresolved",
+                    paragraph,
+                    source_text,
+                    ("source_preserved_after_fallback",),
+                    source_preserved=True,
+                )
+                return original_post_translate(
                     self,
                     paragraph,
-                    "fallback",
-                ):
-                    fallback_text = translate_engine.translate(
-                        source_text,
-                        ignore_cache=True,
-                        rate_limit_params={
-                            "paragraph_token_count": len(source_text),
-                        },
-                    )
-                fallback_validation = validate_translation(
+                    tracker,
+                    translate_input,
                     source_text,
-                    fallback_text,
-                    target_language,
                 )
-                if fallback_validation.accepted:
-                    _record_quality_event(
-                        self.translation_config,
-                        "recovered",
-                        paragraph,
-                        source_text,
-                    )
-                    return original_post_translate(
-                        self,
-                        paragraph,
-                        tracker,
-                        translate_input,
-                        fallback_text,
-                    )
-                validation = fallback_validation
             setattr(tracker, "local_translation_rejection", validation.reasons)
             setattr(tracker, "local_translation_source", source_text)
             setattr(tracker, "local_translate_input", translate_input)

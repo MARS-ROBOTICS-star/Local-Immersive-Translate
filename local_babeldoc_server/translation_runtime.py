@@ -136,6 +136,7 @@ class TranslationRuntime:
                     request=request,
                     started_at=started_at,
                 )
+                self.abort("model_configuration_error")
                 raise
             except Exception as error:
                 failure = self.adapter.classify_error(error)
@@ -176,6 +177,7 @@ class TranslationRuntime:
                         ),
                     )
                     continue
+                self.abort(failure.error_code)
                 raise
 
             usage_complete = (
@@ -736,7 +738,10 @@ class RuntimeBackedTranslator:
             f"Translate the following plain text into {self.lang_out}. "
             "Preserve every number and unit exactly as written; do not "
             "convert numeric notation into words or different units. "
-            "Return the translation in JSON format only.\n\n"
+            "Preserve every placeholder token such as {v1} exactly as written. "
+            "Do not omit or summarize any source text. "
+            "Return only translated plain text without JSON, Markdown, "
+            "labels, or explanations.\n\n"
             f"{text}"
         )
 

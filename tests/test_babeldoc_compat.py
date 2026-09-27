@@ -529,7 +529,7 @@ class BabeldocCompatTest(unittest.TestCase):
         self.assertEqual(translate_input.unicode, "Data")
         self.assertEqual(tracker.input, "Data")
 
-    def test_source_preserved_batch_item_does_not_trigger_third_request(self):
+    def test_source_preserved_batch_item_uses_validated_plain_text_fallback(self):
         modules = fake_modules()
         source = paragraph(
             "This substantial English source paragraph remains intact after "
@@ -540,7 +540,7 @@ class BabeldocCompatTest(unittest.TestCase):
         translator = FakeILTranslator()
         translator.translate_engine = FakeQueuedLLMEngine(
             [],
-            simple_outputs=["不应发送"],
+            simple_outputs=["两次无效响应后，通过纯文本请求恢复译文。"],
             batch_active=True,
             batch_outcomes={stable_id: "source_preserved"},
         )
@@ -572,12 +572,70 @@ class BabeldocCompatTest(unittest.TestCase):
             )
             handle.restore()
 
-        self.assertFalse(result)
-        self.assertEqual(translator.translate_engine.simple_inputs, [])
-        self.assertEqual(tracker.output, source.unicode)
+        self.assertTrue(result)
+        self.assertEqual(
+            translator.translate_engine.simple_inputs,
+            [
+                "This substantial English source paragraph remains intact after "
+                "two invalid provider responses."
+            ],
+        )
+        self.assertEqual(
+            tracker.output,
+            "两次无效响应后，通过纯文本请求恢复译文。",
+        )
         quality = translator.translation_config.local_translation_quality
-        self.assertEqual(quality["unresolved_count"], 1)
-        self.assertTrue(quality["unresolved"][0]["source_preserved"])
+        self.assertEqual(quality["recovered_count"], 1)
+        self.assertEqual(quality["unresolved_count"], 0)
+
+    def test_source_preserved_batch_item_retries_plain_text_fallback_once(self):
+        modules = fake_modules()
+        source = paragraph(
+            "This substantial English source paragraph needs one more attempt."
+        )
+        stable_id = "part-000/page-001/paragraph-000"
+        tracker = FakeTracker()
+        translator = FakeILTranslator()
+        translator.translate_engine = FakeQueuedLLMEngine(
+            [],
+            simple_outputs=[source.unicode, "该英文源段落需要再尝试一次。"],
+            batch_active=True,
+            batch_outcomes={stable_id: "source_preserved"},
+        )
+        registry = ParagraphOriginRegistry()
+        registry.register_native(
+            source,
+            part_index=0,
+            page_number=1,
+            paragraph_index=0,
+            bbox=(40.0, 100.0, 520.0, 112.0),
+            text=source.unicode,
+        )
+        translator.translation_config.local_origin_registry = registry
+        translate_input = translator.TranslateInput(
+            source.unicode,
+            [],
+            source.pdf_style,
+        )
+
+        with patch.dict(sys.modules, modules):
+            handle = install_babeldoc_compat(
+                {"preserve_references": True, "preserve_toc_layout": True}
+            )
+            result = translator.post_translate_paragraph(
+                source,
+                tracker,
+                translate_input,
+                source.unicode,
+            )
+            handle.restore()
+
+        self.assertTrue(result)
+        self.assertEqual(
+            translator.translate_engine.simple_inputs,
+            [translate_input.unicode, translate_input.unicode],
+        )
+        self.assertEqual(tracker.output, "该英文源段落需要再尝试一次。")
 
     def test_batch_quality_rejection_uses_one_validated_fallback(self):
         modules = fake_modules()
@@ -1083,6 +1141,53 @@ class BabeldocCompatTest(unittest.TestCase):
         self.assertTrue(
             background.graphic_state.passthrough_per_char_instruction.endswith(" ")
         )
+
+    def test_skips_ocr_blocks_already_present_as_native_text(self):
+        modules = fake_modules()
+        table_layout = SimpleNamespace(
+            class_name="table",
+            box=SimpleNamespace(x=20.0, y=100.0, x2=520.0, y2=400.0),
+        )
+        native = SimpleNamespace(
+            unicode="Classification",
+            layout_label="text",
+            box=SimpleNamespace(x=40, y=350, x2=140, y2=370),
+        )
+        il_page = SimpleNamespace(
+            page_number=0,
+            page_layout=[table_layout],
+            pdf_character=[],
+            pdf_paragraph=[native],
+            pdf_rectangle=[],
+        )
+        doc = SimpleNamespace(page=[il_page])
+        runtime = FakeOcrRuntime(
+            [
+                OcrTextBlock(
+                    text="Classification",
+                    confidence=0.94,
+                    pdf_box=PdfBox(40, 350, 140, 370),
+                    background_rgb=(255, 255, 255),
+                ),
+                OcrTextBlock(
+                    text="Functions",
+                    confidence=0.96,
+                    pdf_box=PdfBox(360, 350, 500, 370),
+                    background_rgb=(78, 143, 132),
+                ),
+            ]
+        )
+
+        with patch.dict(sys.modules, modules):
+            stats = inject_ocr_table_paragraphs(doc, [object()], runtime)
+
+        self.assertEqual(stats.ocr_table_regions, 1)
+        self.assertEqual(stats.ocr_text_blocks, 1)
+        self.assertEqual(
+            [paragraph.unicode for paragraph in il_page.pdf_paragraph],
+            ["Classification", "Functions"],
+        )
+        self.assertEqual(len(il_page.pdf_rectangle), 1)
 
     def test_runtime_patch_injects_after_paragraph_finder_and_renders_background(self):
         modules = fake_modules()

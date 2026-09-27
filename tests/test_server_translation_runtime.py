@@ -164,8 +164,8 @@ class ServerTranslationRuntimeTest(unittest.TestCase):
 
         self.assertEqual(babeldoc["max_requests_per_document"], 500)
         self.assertEqual(babeldoc["max_estimated_cost_jpy"], 300)
-        self.assertEqual(babeldoc["max_semantic_attempts_per_paragraph"], 2)
-        self.assertEqual(babeldoc["max_billable_exposures_per_paragraph"], 2)
+        self.assertEqual(babeldoc["max_semantic_attempts_per_paragraph"], 4)
+        self.assertEqual(babeldoc["max_billable_exposures_per_paragraph"], 4)
         self.assertEqual(babeldoc["batch_target_source_tokens"], 2400)
         self.assertEqual(babeldoc["batch_max_source_tokens"], 3200)
         self.assertEqual(babeldoc["batch_max_paragraphs"], 40)
@@ -247,6 +247,7 @@ class ServerTranslationRuntimeTest(unittest.TestCase):
             sent = adapter.sent_requests[0]
             self.assertEqual(sent.reasoning_level, "minimal")
             self.assertEqual(sent.response_format["mime_type"], "application/json")
+            self.assertNotIn("without JSON", sent.input)
             audit_files = list(
                 (state.working_dir / "model-tests").glob(
                     "*/api_calls.jsonl"

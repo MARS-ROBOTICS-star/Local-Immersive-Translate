@@ -20,7 +20,7 @@ REFERENCE_HEADINGS = frozenset(
 )
 POST_REFERENCE_HEADING_RE = re.compile(
     r"^(?:appendix(?:\s+[a-z0-9]+)?|supplementary material|"
-    r"author biographies?|about the authors?)$",
+    r"author biographies?|about the authors?|reporting summary)$",
     re.IGNORECASE,
 )
 TOC_HEADING_RE = re.compile(r"^(?:table of )?contents$", re.IGNORECASE)
